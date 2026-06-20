@@ -41,16 +41,20 @@ echo       Done.
 echo [2.5/4] Detecting Clang MC/DC toolchain...
 set "MINGW_BIN="
 for /d %%d in ("%USERPROFILE%\llvm-mingw-*") do set "MINGW_BIN=%%d\bin"
-if defined MINGW_BIN (
-    if exist "!MINGW_BIN!\clang.exe" (
-        set "PATH=!MINGW_BIN!;%PATH%"
-        echo       Clang MC/DC engine: !MINGW_BIN!
-    ) else (
-        echo       Clang not found - static analysis mode.
-    )
-) else (
-    echo       Clang not found - static analysis mode.
+if defined MINGW_BIN if exist "!MINGW_BIN!\clang.exe" (
+    set "PATH=!MINGW_BIN!;%PATH%"
+    echo       Clang MC/DC engine: !MINGW_BIN! ^(llvm-mingw^)
+    goto :clang_done
 )
+where clang >nul 2>&1 && (
+    for /f "delims=" %%c in ('where clang 2^>nul') do (
+        echo       Clang MC/DC engine: %%c ^(system PATH^)
+        goto :clang_done
+    )
+)
+echo       Clang not found - static analysis mode.
+echo       ^(install LLVM + VS Build Tools, or unzip llvm-mingw to %%USERPROFILE%%^)
+:clang_done
 
 echo [3/4] Force-stopping anything on port 5000...
 set "_cleared=0"
