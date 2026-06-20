@@ -62,7 +62,12 @@ def _get_func_detail(abs_path: str, func_name: str, flags: list[str]) -> Optiona
         return None
 
     # 모든 함수 선언에서 시그니처 수집 (stub 생성용)
+    #  - defined_funcs: 이 TU 에서 '정의'된 함수 (stub 금지 -> 중복정의)
+    #  - src_decls: 소스 파일에 '선언'된 함수 (정의 안 된 것은 전부 stub 필요)
+    abs_src_norm = os.path.abspath(abs_path)
     all_func_sigs: dict[str, dict] = {}
+    defined_funcs: set = set()
+    src_decls: set = set()
     for node in tu.cursor.walk_preorder():
         if node.kind == cidx.CursorKind.FUNCTION_DECL and node.spelling:
             all_func_sigs[node.spelling] = {
@@ -71,6 +76,13 @@ def _get_func_detail(abs_path: str, func_name: str, flags: list[str]) -> Optiona
                              "type": a.type.spelling}
                             for i, a in enumerate(node.get_arguments())],
             }
+            if node.is_definition():
+                defined_funcs.add(node.spelling)
+            if (node.location.file
+                    and os.path.abspath(node.location.file.name) == abs_src_norm):
+                src_decls.add(node.spelling)
+    # 소스에 선언됐으나 정의 안 된 함수 = 반드시 stub (직접/간접 호출 무관)
+    stub_funcs = src_decls - defined_funcs
 
     # 최상위 전역변수(외부 링키지) 수집 — 하니스에서 extern 으로 세팅 가능
     all_globals: dict[str, str] = {}
@@ -105,6 +117,8 @@ def _get_func_detail(abs_path: str, func_name: str, flags: list[str]) -> Optiona
                 "params": params,
                 "callees": callees,
                 "all_sigs": all_func_sigs,
+                "defined_funcs": defined_funcs,
+                "stub_funcs": stub_funcs,
                 "all_globals": all_globals,
             }
     return None
@@ -365,9 +379,13 @@ def _emit_harness(func_name: str, detail: dict, vectors: list[dict],
     if globals_used:
         L.append("")
 
-    # 피호출 함수 stub (올바른 시그니처 사용)
+    # 미정의 함수 stub — 소스에 선언만 되고 정의 안 된 함수 전부
+    # (간접 호출 대비). 정의된 함수는 소스에서 링크되므로 제외.
     sigs = detail["all_sigs"]
-    for callee in sorted(detail["callees"]):
+    stub_targets = detail.get("stub_funcs")
+    if stub_targets is None:   # 폴백: 직접 callee 중 미정의
+        stub_targets = detail["callees"] - detail.get("defined_funcs", set())
+    for callee in sorted(stub_targets):
         sig = sigs.get(callee, {"ret": "int", "params": []})
         ret = sig["ret"]
         if not sig["params"]:
@@ -474,30 +492,38 @@ def export_cov(llvm_cov: str, exe: str, profdata: str) -> dict:
 # ============================================================
 # 9. JSON 파싱 — MC/DC + branch + statement
 # ============================================================
-def parse_cov(cov_data: dict, src_basename: str) -> dict:
-    files  = cov_data.get("data", [{}])[0].get("files", [])
+def _parse_mcdc_records(raw_records: list) -> list:
+    out = []
+    for r in raw_records:
+        # 레코드: [L1,C1,L2,C2,..,kind, [조건별 독립영향 bool], [테스트벡터 dict]]
+        # 독립영향 리스트 = '불리언으로 이뤄진 리스트' (dict 리스트인 마지막과 구분)
+        conds = []
+        for el in r if isinstance(r, list) else []:
+            if isinstance(el, list) and el and isinstance(el[0], bool):
+                conds = el
+                break
+        out.append({
+            "line": r[0] if r else 0,
+            "num_conditions": len(conds),
+            "conditions_covered": conds,
+            "covered": bool(conds) and all(conds),
+        })
+    return out
+
+
+def parse_cov(cov_data: dict, src_basename: str,
+              func_name: Optional[str] = None,
+              start_ln: Optional[int] = None,
+              end_ln: Optional[int] = None) -> dict:
+    data0  = cov_data.get("data", [{}])[0]
+    files  = data0.get("files", [])
     target = next(
         (f for f in files
          if os.path.basename(f.get("filename", "")) == src_basename),
         files[0] if files else {}
     )
-    summ = target.get("summary", {})
-    mcdc_sum  = summ.get("mcdc", {})
-    br_sum    = summ.get("branches", {})
-    stmt_sum  = summ.get("lines", {})
 
-    # MC/DC 레코드 파싱 (어느 조건이 미충족인지)
-    mcdc_records = []
-    for r in target.get("mcdc_records", []):
-        conds = r[-1] if isinstance(r[-1], list) else []
-        mcdc_records.append({
-            "line": r[0] if r else 0,
-            "num_conditions": len(conds),
-            "conditions_covered": conds,   # [True/False per condition]
-            "covered": all(conds) if conds else False,
-        })
-
-    # 라인별 실행 횟수 (segments에서 추출)
+    # 라인별 실행 횟수 (segments에서 추출) — 소스뷰어 색칠용 (파일 전체)
     line_hits: dict[int, int] = {}
     prev_count = 0
     for seg in target.get("segments", []):
@@ -508,15 +534,51 @@ def parse_cov(cov_data: dict, src_basename: str) -> dict:
                 prev_count = count
             line_hits.setdefault(line, prev_count)
 
+    # ── 함수 단위 스코핑 (가능하면) — 대상 함수만의 STMT/BR/MC/DC ──
+    fn = None
+    if func_name:
+        fn = next((g for g in data0.get("functions", [])
+                   if g.get("name") == func_name), None)
+    if fn is not None:
+        branches = fn.get("branches", [])
+        # branch entry: [L1,C1,L2,C2, trueCount, falseCount, ...]
+        br_total = len(branches)
+        br_cov = sum(1 for b in branches if len(b) >= 6 and b[4] > 0 and b[5] > 0)
+        branch_pct = round(100 * br_cov / br_total) if br_total else 100
+
+        mcdc_records = _parse_mcdc_records(fn.get("mcdc_records", []))
+        mcdc_total = len(mcdc_records)
+        mcdc_cov = sum(1 for r in mcdc_records if r["covered"])
+        mcdc_pct = round(100 * mcdc_cov / mcdc_total) if mcdc_total else branch_pct
+
+        # STMT: 함수 라인 범위의 실행 라인 비율
+        if start_ln is not None and end_ln is not None:
+            rng = {ln: c for ln, c in line_hits.items() if start_ln <= ln <= end_ln}
+        else:
+            rng = line_hits
+        stmt_total = len(rng)
+        stmt_cov = sum(1 for c in rng.values() if c > 0)
+        stmt_pct = round(100 * stmt_cov / stmt_total) if stmt_total else 100
+
+        return {
+            "stmt_pct": stmt_pct, "branch_pct": branch_pct, "mcdc_pct": mcdc_pct,
+            "mcdc_count": mcdc_total, "mcdc_records": mcdc_records,
+            "line_hits": line_hits,
+        }
+
+    # ── 폴백: 파일 전체 summary ──
+    summ = target.get("summary", {})
+    mcdc_sum, br_sum, stmt_sum = (summ.get("mcdc", {}), summ.get("branches", {}),
+                                  summ.get("lines", {}))
     mcdc_pct = round(mcdc_sum.get("percent", 0.0) if mcdc_sum.get("count", 0) > 0
                      else br_sum.get("percent", 0.0))
     return {
-        "stmt_pct":       round(stmt_sum.get("percent", 0.0)),
-        "branch_pct":     round(br_sum.get("percent", 0.0)),
-        "mcdc_pct":       mcdc_pct,
-        "mcdc_count":     mcdc_sum.get("count", 0),
-        "mcdc_records":   mcdc_records,
-        "line_hits":      line_hits,
+        "stmt_pct":     round(stmt_sum.get("percent", 0.0)),
+        "branch_pct":   round(br_sum.get("percent", 0.0)),
+        "mcdc_pct":     mcdc_pct,
+        "mcdc_count":   mcdc_sum.get("count", 0),
+        "mcdc_records": _parse_mcdc_records(target.get("mcdc_records", [])),
+        "line_hits":    line_hits,
     }
 
 
@@ -586,7 +648,8 @@ def recompute(unit_ref: str, tc_ids: list) -> Optional[dict]:
     try:
         pd = merge_profile(meta["profdata_tool"], profraws, wd, out="sel.profdata")
         cdata = export_cov(meta["cov_tool"], meta["exe"], pd)
-        cov = parse_cov(cdata, meta["src_basename"])
+        cov = parse_cov(cdata, meta["src_basename"], meta.get("func_name"),
+                        meta["start_ln"], meta["end_ln"])
     except Exception:
         return None
     source = build_source(meta["abs_src"], meta["start_ln"], meta["end_ln"], cov["line_hits"])
@@ -673,7 +736,7 @@ def generate(unit_ref: str, abs_src: str, func_name: str,
         cov_data = export_cov(cov_tool, exe, profdata)
 
         src_basename = os.path.basename(abs_src)
-        cov = parse_cov(cov_data, src_basename)
+        cov = parse_cov(cov_data, src_basename, func_name, start_ln, end_ln)
         log("info",
             f"[clang-mcdc] STMT {cov['stmt_pct']}% "
             f"| BR {cov['branch_pct']}% "
@@ -693,6 +756,7 @@ def generate(unit_ref: str, abs_src: str, func_name: str,
         keep_workdir = True
         _cache_unit(unit_ref, {
             "workdir": workdir, "exe": exe, "src_basename": src_basename,
+            "func_name": func_name,
             "start_ln": start_ln, "end_ln": end_ln, "abs_src": abs_src,
             "n_tcs": len(vectors), "profdata_tool": profdata_tool,
             "cov_tool": cov_tool,
