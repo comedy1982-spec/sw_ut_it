@@ -20,8 +20,10 @@ import os
 import sys
 import re
 import json
+import html as _htmlmod
+from datetime import datetime
 
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, Response
 
 # 엔진 모듈 경로 추가 (flask_app/ 의 부모 = backend 묶음 가정)
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -204,6 +206,16 @@ def api_cov_select():
     if not res:
         return jsonify({"ok": False, "error": "캐시 없음 (재생성 필요)"})
     return jsonify(res)
+
+
+@app.route("/api/report", methods=["POST"])
+def api_report():
+    """현재 화면(선택된 TC 기준)을 VectorCAST 풍 HTML 리포트로 출력."""
+    payload = request.json or {}
+    html_out = _build_report_html(payload)
+    fname = f"swts_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+    return Response(html_out, mimetype="text/html",
+                    headers={"Content-Disposition": f'inline; filename="{fname}"'})
 
 
 # ============================================================
@@ -1157,6 +1169,268 @@ def _mock_generate(unit_ref):
         "notes": ["목업 데이터 (check_fault 는 Z3 단계에서 실제화 예정)"],
         "logs": [{"level": "info", "text": "[mock] check_fault 목업 응답"}],
     }
+
+
+# ============================================================
+# VectorCAST 풍 HTML 리포트 생성
+# ============================================================
+def _esc(s) -> str:
+    return _htmlmod.escape("" if s is None else str(s))
+
+
+def _cov_color(pct: float) -> str:
+    return "#2e9e44" if pct >= 100 else ("#d6a417" if pct >= 75 else "#c0392b")
+
+
+def _bar(pct) -> str:
+    p = max(0, min(100, int(round(pct or 0))))
+    return (f'<div class="bar"><div class="bar-fill" '
+            f'style="width:{p}%;background:{_cov_color(p)}"></div>'
+            f'<span class="bar-txt">{p}%</span></div>')
+
+
+def _line_cls(ref: str, ln: dict, checked: set) -> str:
+    """프론트 buildCovMap 과 동일한 규칙으로 라인 커버리지 등급 산출."""
+    tcs = ln.get("tcs") or []
+    if tcs:
+        active = [t for t in tcs if f"{ref}::{t}" in checked]
+        return "full" if active else "none"
+    cov = ln.get("cov")
+    if cov == "full":
+        return "full"
+    if cov == "none":
+        return "none"
+    return "raw"
+
+
+def _kv(d: dict) -> str:
+    if not d:
+        return "<span class='muted'>–</span>"
+    return ",&nbsp; ".join(f"{_esc(k)}=<b>{_esc(v)}</b>" for k, v in d.items())
+
+
+_VERDICT_LABEL = {"pass": ("PASS", "v-pass"), "fail": ("FAIL", "v-fail"),
+                  "manual": ("MANUAL", "v-man")}
+
+
+def _build_report_html(payload: dict) -> str:
+    root = payload.get("root", "") or "(미지정)"
+    checked = set(payload.get("checked", []))
+    units: dict = payload.get("units", {}) or {}
+    mode_seen = sorted({(u.get("mode") or "mock") for u in units.values()}) or ["mock"]
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    project = os.path.basename(root.rstrip("/\\")) or "SWTS"
+
+    # 컴포넌트 매핑: 스캔 캐시(있으면) → 없으면 경로 기반 폴백
+    _comp_cache = _scan_cache.get(os.path.abspath(root), {}).get("components", {})
+
+    def _comp_of(ref: str) -> str:
+        for cn, cd in _comp_cache.items():
+            if any(x.get("unit_ref") == ref for x in cd.get("units", [])):
+                return cn
+        rel = ref.split("::")[0]
+        return os.path.basename(os.path.dirname(rel)) or os.path.basename(rel)
+
+    # ── 유닛별 집계 ──
+    rows = []          # (ref, comp, func, stmt, branch, mcdc, n_tc, n_pass, n_fail, n_man)
+    total_tc = total_pass = total_fail = total_man = 0
+    sum_stmt = sum_br = sum_mcdc = 0.0
+    for ref, u in units.items():
+        comp = _comp_of(ref)
+        func = ref.split("::")[-1]
+        src = u.get("source", []) or []
+        execu = [s for s in src if _line_cls(ref, s, checked) in ("full", "none")]
+        cov_full = sum(1 for s in execu if _line_cls(ref, s, checked) == "full")
+        stmt = round(100 * cov_full / len(execu)) if execu else 0
+        cov = u.get("coverage", {}) or {}
+        br, mc = cov.get("branch", stmt), cov.get("mcdc", stmt)
+        cases = u.get("cases", []) or []
+        n_p = sum(1 for c in cases if c.get("verdict") == "pass")
+        n_f = sum(1 for c in cases if c.get("verdict") == "fail")
+        n_m = sum(1 for c in cases if c.get("verdict") == "manual")
+        rows.append((ref, comp, func, stmt, br, mc, len(cases), n_p, n_f, n_m))
+        total_tc += len(cases); total_pass += n_p; total_fail += n_f; total_man += n_m
+        sum_stmt += stmt; sum_br += br; sum_mcdc += mc
+
+    n_units = len(units) or 1
+    agg_stmt = round(sum_stmt / n_units)
+    agg_br = round(sum_br / n_units)
+    agg_mcdc = round(sum_mcdc / n_units)
+
+    def anchor(ref):
+        return "u_" + re.sub(r"[^A-Za-z0-9]", "_", ref)
+
+    P = []
+    P.append(f"""<!doctype html><html lang="ko"><head><meta charset="utf-8"/>
+<title>SWTS Coverage Report — {_esc(project)}</title>
+<style>
+ *{{box-sizing:border-box}}
+ body{{margin:0;font-family:"Segoe UI",system-ui,sans-serif;color:#1f2733;background:#eef1f5;font-size:13px}}
+ .page{{max-width:1080px;margin:0 auto;background:#fff;box-shadow:0 0 0 1px #d6dce5}}
+ .banner{{background:linear-gradient(180deg,#13395f,#0e2c4a);color:#fff;padding:22px 32px}}
+ .banner h1{{margin:0;font-size:22px;letter-spacing:.5px}}
+ .banner .tool{{font-size:11px;opacity:.8;font-family:ui-monospace,Consolas,monospace;margin-top:4px}}
+ .banner .rt{{float:right;text-align:right;font-size:11px;opacity:.9;font-family:ui-monospace,Consolas,monospace}}
+ section{{padding:18px 32px;border-bottom:1px solid #e6eaf0}}
+ h2{{font-size:15px;color:#13395f;border-left:4px solid #2f6db0;padding-left:9px;margin:0 0 12px}}
+ h3{{font-size:13.5px;color:#13395f;margin:0}}
+ table{{border-collapse:collapse;width:100%;font-size:12px}}
+ th,td{{border:1px solid #d6dce5;padding:5px 8px;text-align:left;vertical-align:top}}
+ th{{background:#f0f3f8;color:#324a63;font-weight:600;white-space:nowrap}}
+ td.num,th.num{{text-align:right;font-family:ui-monospace,Consolas,monospace}}
+ tr:nth-child(even) td{{background:#fafbfd}}
+ .meta td:first-child{{width:160px;color:#5a6b80;background:#f7f9fc;font-weight:600}}
+ .bar{{position:relative;height:16px;background:#e6eaf0;border-radius:3px;min-width:120px;overflow:hidden}}
+ .bar-fill{{position:absolute;left:0;top:0;bottom:0;border-radius:3px}}
+ .bar-txt{{position:absolute;right:6px;top:0;line-height:16px;font-size:10.5px;font-weight:700;color:#1f2733;font-family:ui-monospace,Consolas,monospace}}
+ .cards{{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:6px}}
+ .card{{flex:1;min-width:150px;border:1px solid #d6dce5;border-radius:6px;padding:12px 14px;background:#f9fbfd}}
+ .card .lbl{{font-size:10.5px;color:#5a6b80;text-transform:uppercase;letter-spacing:.5px}}
+ .card .big{{font-size:26px;font-weight:700;margin:3px 0;font-family:ui-monospace,Consolas,monospace}}
+ .pill{{display:inline-block;padding:1px 7px;border-radius:10px;font-size:10.5px;font-weight:700;font-family:ui-monospace,Consolas,monospace}}
+ .v-pass{{background:#e3f4e8;color:#1d7a36;border:1px solid #9ed4ad}}
+ .v-fail{{background:#fbe5e7;color:#b3261e;border:1px solid #e3a0a0}}
+ .v-man{{background:#fdf3da;color:#8a6400;border:1px solid #e6cd86}}
+ a{{color:#2f6db0;text-decoration:none}} a:hover{{text-decoration:underline}}
+ .muted{{color:#9aa6b5}}
+ .unit-head{{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}}
+ .code{{font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:18px;border:1px solid #d6dce5;border-radius:5px;overflow:hidden}}
+ .cl{{display:flex;white-space:pre}}
+ .cl .g{{width:4px;flex-shrink:0}}
+ .cl .no{{width:46px;flex-shrink:0;text-align:right;padding:0 8px;color:#9aa6b5;background:#f7f9fc;border-right:1px solid #e6eaf0}}
+ .cl .ft{{width:30px;flex-shrink:0;text-align:center;color:#9aa6b5;font-size:10px}}
+ .cl .ft .T{{color:#1d7a36;font-weight:700}} .cl .ft .F{{color:#b3261e;font-weight:700}}
+ .cl .tx{{flex:1;padding:0 8px}}
+ .full{{background:#e7f5ec}} .full .g{{background:#2e9e44}}
+ .none{{background:#fbe8ea}} .none .g{{background:#c0392b}}
+ .raw .g{{background:transparent}}
+ .mcdc td .ok{{color:#1d7a36;font-weight:700}} .mcdc td .miss{{color:#b3261e;font-weight:700}}
+ .legend{{font-size:11px;color:#5a6b80;display:flex;gap:14px;margin-top:8px}}
+ .legend i{{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}}
+ .footer{{padding:14px 32px;font-size:11px;color:#7a879a;text-align:center}}
+ @media print{{body{{background:#fff}} .page{{box-shadow:none}} section{{page-break-inside:avoid}}}}
+</style></head><body><div class="page">""")
+
+    # ── 배너 ──
+    P.append(f"""<div class="banner">
+  <div class="rt">생성: {now}<br>사용자: {_esc(os.environ.get('USERNAME','-'))}</div>
+  <h1>Software Test Coverage Report</h1>
+  <div class="tool">SWTS Studio · 2-Stage / MC/DC · format: VectorCAST-style</div>
+</div>""")
+
+    # ── 리포트 구성 정보 ──
+    P.append(f"""<section><h2>Report Configuration</h2>
+  <table class="meta">
+   <tr><td>Project</td><td>{_esc(project)}</td></tr>
+   <tr><td>Source Root</td><td>{_esc(root)}</td></tr>
+   <tr><td>Measurement Mode</td><td>{_esc(', '.join(mode_seen))}</td></tr>
+   <tr><td>Coverage Type</td><td>Statement · Branch (Decision) · MC/DC</td></tr>
+   <tr><td>Units Under Test</td><td>{len(units)}</td></tr>
+   <tr><td>Generated</td><td>{now}</td></tr>
+  </table></section>""")
+
+    # ── 전체 결과 요약 ──
+    P.append(f"""<section><h2>Overall Results</h2>
+  <div class="cards">
+    <div class="card"><div class="lbl">Statement</div><div class="big" style="color:{_cov_color(agg_stmt)}">{agg_stmt}%</div>{_bar(agg_stmt)}</div>
+    <div class="card"><div class="lbl">Branch / Decision</div><div class="big" style="color:{_cov_color(agg_br)}">{agg_br}%</div>{_bar(agg_br)}</div>
+    <div class="card"><div class="lbl">MC/DC</div><div class="big" style="color:{_cov_color(agg_mcdc)}">{agg_mcdc}%</div>{_bar(agg_mcdc)}</div>
+    <div class="card"><div class="lbl">Test Cases</div><div class="big">{total_tc}</div>
+      <span class="pill v-pass">PASS {total_pass}</span> <span class="pill v-fail">FAIL {total_fail}</span> <span class="pill v-man">MAN {total_man}</span></div>
+  </div></section>""")
+
+    # ── 유닛 요약 테이블 (목차) ──
+    P.append("""<section><h2>Units Summary</h2>
+  <table><thead><tr>
+   <th>#</th><th>Component</th><th>Function (Unit)</th>
+   <th class="num">Statement</th><th class="num">Branch</th><th class="num">MC/DC</th>
+   <th class="num">Tests</th><th>Result</th></tr></thead><tbody>""")
+    for i, (ref, comp, func, stmt, br, mc, ntc, np_, nf, nm) in enumerate(rows, 1):
+        result = (f'<span class="pill v-fail">FAIL {nf}</span>' if nf else
+                  f'<span class="pill v-pass">PASS {np_}</span>'
+                  + (f' <span class="pill v-man">MAN {nm}</span>' if nm else ''))
+        P.append(f"""<tr><td class="num">{i}</td><td>{_esc(comp)}</td>
+   <td><a href="#{anchor(ref)}">{_esc(func)}</a></td>
+   <td class="num" style="color:{_cov_color(stmt)}">{stmt}%</td>
+   <td class="num" style="color:{_cov_color(br)}">{br}%</td>
+   <td class="num" style="color:{_cov_color(mc)}">{mc}%</td>
+   <td class="num">{ntc}</td><td>{result}</td></tr>""")
+    P.append("</tbody></table></section>")
+
+    # ── 유닛 상세 ──
+    for (ref, comp, func, stmt, br, mc, ntc, np_, nf, nm) in rows:
+        u = units[ref]
+        P.append(f"""<section id="{anchor(ref)}">
+  <div class="unit-head">
+    <h3>📦 {_esc(comp)} &nbsp;›&nbsp; <span style="font-family:ui-monospace,Consolas,monospace">{_esc(func)}</span></h3>
+    <div style="font-size:11px;color:#7a879a;font-family:ui-monospace,Consolas,monospace">{_esc(ref)}</div>
+  </div>
+  <div class="cards">
+    <div class="card"><div class="lbl">Statement</div><div class="big" style="color:{_cov_color(stmt)}">{stmt}%</div>{_bar(stmt)}</div>
+    <div class="card"><div class="lbl">Branch</div><div class="big" style="color:{_cov_color(br)}">{br}%</div>{_bar(br)}</div>
+    <div class="card"><div class="lbl">MC/DC</div><div class="big" style="color:{_cov_color(mc)}">{mc}%</div>{_bar(mc)}</div>
+  </div>""")
+
+        # 테스트케이스 테이블
+        P.append("""<table><thead><tr><th>Test Case</th><th>Description</th>
+   <th>Inputs</th><th>Expected</th><th>Status</th></tr></thead><tbody>""")
+        for c in (u.get("cases", []) or []):
+            label, vcls = _VERDICT_LABEL.get(c.get("verdict", "manual"), ("N/A", "v-man"))
+            sel = "" if f"{ref}::{c.get('id')}" in checked else " <span class='muted'>(미선택)</span>"
+            P.append(f"""<tr><td style="font-family:ui-monospace,Consolas,monospace;color:#2f6db0">{_esc(c.get('id'))}{sel}</td>
+   <td>{_esc(c.get('desc',''))}</td><td>{_kv(c.get('inputs'))}</td>
+   <td>{_kv(c.get('expected'))}</td><td><span class="pill {vcls}">{label}</span></td></tr>""")
+        P.append("</tbody></table>")
+
+        # 커버리지 주석 소스
+        src = u.get("source", []) or []
+        if src:
+            P.append('<div style="margin-top:12px"></div><div class="code">')
+            for s in src:
+                cls = _line_cls(ref, s, checked)
+                ft = ""
+                if s.get("is_branch") and cls == "full":
+                    ft = '<span class="T">T</span><span class="F">F</span>'
+                elif s.get("is_branch") and cls == "none":
+                    ft = '<span class="muted">T F</span>'
+                P.append(f'<div class="cl {cls}"><span class="g"></span>'
+                         f'<span class="no">{s.get("n","")}</span>'
+                         f'<span class="ft">{ft}</span>'
+                         f'<span class="tx">{_esc(s.get("text",""))}</span></div>')
+            P.append("</div>")
+            P.append('<div class="legend">'
+                     '<span><i style="background:#2e9e44"></i>covered</span>'
+                     '<span><i style="background:#c0392b"></i>not covered</span>'
+                     '<span><b style="color:#1d7a36">T</b>/<b style="color:#b3261e">F</b> branch</span>'
+                     '</div>')
+
+        # MC/DC 조건 분석
+        recs = u.get("mcdc_records", []) or []
+        if recs:
+            P.append("""<div style="margin-top:14px"></div>
+  <table class="mcdc"><thead><tr><th>Line</th><th>Conditions (C1..Cn)</th>
+   <th class="num">Covered</th><th>Decision</th></tr></thead><tbody>""")
+            for r in recs:
+                conds = r.get("conditions_covered", []) or []
+                cells = " ".join(
+                    f'<span class="{"ok" if ok else "miss"}">C{i+1}{"✓" if ok else "✗"}</span>'
+                    for i, ok in enumerate(conds)) or "<span class='muted'>–</span>"
+                n = len(conds); cv = sum(1 for x in conds if x)
+                pct = round(100 * cv / n) if n else 0
+                dec = ('<span class="pill v-pass">covered</span>' if r.get("covered")
+                       else '<span class="pill v-fail">missed</span>')
+                P.append(f'<tr><td class="num">L{_esc(r.get("line"))}</td><td>{cells}</td>'
+                         f'<td class="num">{pct}%</td><td>{dec}</td></tr>')
+            P.append("</tbody></table>")
+
+        P.append("</section>")
+
+    P.append(f"""<div class="footer">
+   SWTS Studio — Software unit/integration Test Studio · VectorCAST-style report<br>
+   본 리포트의 커버리지는 현재 선택된 테스트케이스 기준으로 산출되었습니다.
+   ({', '.join(mode_seen)} 모드 · 정적 모드는 추정값)
+  </div></div></body></html>""")
+    return "".join(P)
 
 
 if __name__ == "__main__":

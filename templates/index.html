@@ -228,6 +228,8 @@
   <span class="spacer"></span>
   <span id="selCount" style="font-size:11px;color:var(--dim);font-family:var(--mono)"></span>
   <span id="modeBadge" class="badge mock">MOCK</span>
+  <button id="reportBtn" class="btn" style="background:#2ea043;color:#fff" disabled
+          title="VectorCAST 풍 HTML 리포트 출력">📊 리포트</button>
   <button id="genBtn" class="btn" disabled>▶ TC 생성</button>
 </div>
 
@@ -362,6 +364,7 @@ function applyData(data) {
     '<div class="empty">유닛을 체크 후 \'TC 생성\' 버튼을 누르세요.</div>';
   document.getElementById('chips').innerHTML = '';
   document.getElementById('legend').style.display = 'none';
+  document.getElementById('reportBtn').disabled = true;
   updateSelCount();
   buildTree();
 }
@@ -657,7 +660,33 @@ document.getElementById('genBtn').onclick = async () => {
   renderTcs();
   updateAggChips();
   btn.disabled = false; btn.textContent = '▶ TC 생성';
+  document.getElementById('reportBtn').disabled = Object.keys(unitCov).length === 0;
   updateSelCount();
+};
+
+/* ═══════════════════════════════════════════
+   리포트 출력 (VectorCAST 풍 HTML)
+═══════════════════════════════════════════ */
+document.getElementById('reportBtn').onclick = async () => {
+  if (!Object.keys(unitCov).length) { alert('먼저 TC를 생성하세요.'); return; }
+  const btn = document.getElementById('reportBtn');
+  const prev = btn.textContent;
+  btn.disabled = true; btn.textContent = '⏳ 생성 중…';
+  try {
+    const payload = { root: currentRoot, checked: [...checkedTcs], units: unitCov };
+    const r = await fetch('/api/report', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload)});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const html = await r.blob();
+    const url  = URL.createObjectURL(html);
+    window.open(url, '_blank');          // 새 탭에서 미리보기 (브라우저에서 저장/인쇄 가능)
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  } catch (e) {
+    alert('리포트 생성 실패: ' + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = prev;
+  }
 };
 
 /* ═══════════════════════════════════════════
