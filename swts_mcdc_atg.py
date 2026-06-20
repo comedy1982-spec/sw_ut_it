@@ -347,6 +347,56 @@ def _mcdc_rows(atoms, ast, idx):
 
 
 # ============================================================
+# 2.4 경계값·강건성(Robustness) 데이터 주입
+#  - SMT 해 중에서 타입 한계값/오버플로·언더플로/경계값을 '우선 채택'
+# ============================================================
+_INT_MAX = 0x7FFFFFFF        # 2147483647
+_INT_MIN = -0x80000000       # -2147483648
+
+
+def _consts_in(node, const_map, acc):
+    """조건식에 등장하는 비교 상수(리터럴/매크로) 수집."""
+    t = node[0]
+    if t == "num":
+        acc.add(node[1])
+    elif t == "id" and node[1] in const_map:
+        acc.add(const_map[node[1]])
+    elif t == "un":
+        _consts_in(node[2], const_map, acc)
+    elif t == "bin":
+        _consts_in(node[2], const_map, acc)
+        _consts_in(node[3], const_map, acc)
+
+
+def _robust_cands(atoms, const_map):
+    """우선순위 후보값: 한계값(오버/언더플로) → 비교상수 경계(C±1) → 0/±1."""
+    consts = set()
+    for a in atoms:
+        _consts_in(a, const_map, consts)
+    cands = [_INT_MAX, _INT_MIN]                  # 타입 한계 · 오버/언더플로 유발
+    for c in sorted(consts):                      # 경계값 분석 (C-1, C, C+1)
+        cands += [c - 1, c, c + 1]
+    cands += [0, 1, -1]
+    seen, out = set(), []
+    for v in cands:
+        if v not in seen:
+            seen.add(v); out.append(v)
+    return out
+
+
+def _bias_robust(s, inputs, cands):
+    """SAT 솔버에서 각 입력변수를 우선순위 후보값으로 핀(MC/DC 유지 한도 내 극값)."""
+    for var in inputs.values():
+        for cv in cands:
+            s.push()
+            s.add(var == z3.BitVecVal(cv & 0xFFFFFFFF, 32))
+            if s.check() == z3.sat:
+                break          # 핀 유지(pop 안 함)
+            s.pop()            # 불가 -> 다음 후보
+    return s.model() if s.check() == z3.sat else None
+
+
+# ============================================================
 # 함수 본문 -> 결정 목록(로컬 정의 + 경로 제약 포함)
 # ============================================================
 _IF_RE = re.compile(r"^\}?\s*(?:else\s+if|if)\s*\((.*)\)\s*\{?\s*$")
@@ -443,6 +493,7 @@ def generate(body, const_map, ptr_name, scalar_names, globals_map,
             continue
         idx = {id(a): i for i, a in enumerate(atoms)}
         rows = _mcdc_rows(atoms, dast, idx)
+        cands = _robust_cands(atoms, const_map)   # 2.4 강건성 후보값(우선순위)
         for row in rows:
             ctx = _Z3Ctx(const_map, ptr_name, scalar_names, globals_map, stub_funcs)
             try:
@@ -461,29 +512,33 @@ def generate(body, const_map, ptr_name, scalar_names, globals_map,
                         pass
                 if s.check() != z3.sat:
                     continue
-                model = s.model()
+                models = [s.model()]                          # 기본 해(분기 커버 유지)
+                rob = _bias_robust(s, ctx.inputs, cands)      # 2.4 강건성 해(한계값)
+                if rob is not None:
+                    models.append(rob)
             except Exception:
                 continue
-            assign = _blank()
             bucket = {"field": "fields", "scalar": "scalars",
                       "global": "globals", "global_lv": "global_lv",
                       "sret": "srets"}
-            for (kind, target), var in ctx.inputs.items():
-                try:
-                    val = model.eval(var, model_completion=True).as_signed_long()
-                except Exception:
-                    val = 0
-                assign[bucket[kind]][target] = str(val)
-            assign["_extern"] = dict(ctx.extern)
-            key = (tuple(sorted(assign["fields"].items())),
-                   tuple(sorted(assign["scalars"].items())),
-                   tuple(sorted(assign["globals"].items())),
-                   tuple(sorted(assign["global_lv"].items())),
-                   tuple(sorted(assign["srets"].items())))
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(assign)
-            if len(out) >= max_vectors:
-                return out
+            for model in models:                             # 기본 + 강건성 둘 다 방출
+                assign = _blank()
+                for (kind, target), var in ctx.inputs.items():
+                    try:
+                        val = model.eval(var, model_completion=True).as_signed_long()
+                    except Exception:
+                        val = 0
+                    assign[bucket[kind]][target] = str(val)
+                assign["_extern"] = dict(ctx.extern)
+                key = (tuple(sorted(assign["fields"].items())),
+                       tuple(sorted(assign["scalars"].items())),
+                       tuple(sorted(assign["globals"].items())),
+                       tuple(sorted(assign["global_lv"].items())),
+                       tuple(sorted(assign["srets"].items())))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(assign)
+                if len(out) >= max_vectors:
+                    return out
     return out
