@@ -25,7 +25,7 @@ except Exception:
 # C 식 토크나이저 / 파서 (조건식·로컬 대입 우변 해석용)
 # ============================================================
 _OPS2 = ("->", "<<", ">>", "<=", ">=", "==", "!=", "&&", "||")
-_OPS1 = set("-+*/%&|^~!<>()[],")
+_OPS1 = set("-+*/%&|^~!<>()[],.")
 
 
 def _tokenize(s):
@@ -107,6 +107,11 @@ class _Parser:
                 if kk != "id":
                     raise ValueError("field name")
                 node = ("field", node, nm)
+            elif k == "op" and v == ".":
+                self._next(); kk, nm = self._next()
+                if kk != "id":
+                    raise ValueError("member name")
+                node = ("dot", node, nm)
             elif k == "op" and v == "[":
                 self._next(); idx = self._expr(0)
                 if self._next() != ("op", "]"):
@@ -148,6 +153,48 @@ def _parse(text):
         return None
 
 
+def _render_links(links):
+    s = ""
+    for kind, payload in links:
+        s += (f"[{payload}]" if kind == "index" else "." + payload)
+    return s
+
+
+def _lvalue(node, ptr_name, globals_map):
+    """멤버/인덱스 체인을 설정 가능한 lvalue 로 해석.
+    반환 (kind, base, path):
+      ('field', None, 'cfg.limit')        -> 구조체 var 하위 경로 (m->cfg.limit)
+      ('global_lv', 'g_state', 'g_state.mode') -> 전역 집계 멤버
+    해석 불가(다단계 포인터/비상수 인덱스/미지 루트)면 None."""
+    links = []
+    cur = node
+    while cur[0] in ("field", "dot", "index"):
+        if cur[0] == "field":
+            links.append(("arrow", cur[2])); cur = cur[1]
+        elif cur[0] == "dot":
+            links.append(("dot", cur[2])); cur = cur[1]
+        else:                                  # index — 상수만
+            if cur[2][0] != "num":
+                return None
+            links.append(("index", cur[2][1])); cur = cur[1]
+    if cur[0] != "id" or not links:
+        return None
+    root = cur[1]
+    links.reverse()
+    if root == ptr_name:
+        # m->...: 첫 링크는 화살표여야 하고, 이후엔 더 깊은 포인터(->) 금지(=다단계, 1단계만)
+        if links[0][0] != "arrow":
+            return None
+        if any(lk[0] == "arrow" for lk in links[1:]):
+            return None
+        return ("field", None, _render_links(links).lstrip("."))
+    if root in globals_map:
+        if any(lk[0] == "arrow" for lk in links):   # 전역이 포인터 -> 보류
+            return None
+        return ("global_lv", root, root + _render_links(links))
+    return None
+
+
 # ============================================================
 # AST -> Z3 (32-bit BitVec, C int 부호 의미)
 # ============================================================
@@ -162,12 +209,15 @@ class _Z3Ctx:
         self.stubs = stub_funcs
         self.env = {}            # local name -> z3 bv
         self.inputs = {}         # (kind, target) -> bv
+        self.extern = {}         # 집계 전역 base -> type (extern 선언용)
         self._free = 0
 
-    def _inp(self, kind, target):
+    def _inp(self, kind, target, base=None):
         key = (kind, target)
         if key not in self.inputs:
             self.inputs[key] = z3.BitVec(f"{kind}__{target}", 32)
+            if base is not None:
+                self.extern[base] = self.globs.get(base, "int")
         return self.inputs[key]
 
     def _fresh(self):
@@ -192,17 +242,16 @@ class _Z3Ctx:
             if nm in self.globs:
                 return self._inp("global", nm)
             return self._fresh()
-        if t == "field":
-            base, fld = node[1], node[2]
-            if base[0] == "id" and self.ptr and base[1] == self.ptr:
-                return self._inp("field", fld)
+        if t in ("field", "dot", "index"):
+            lv = _lvalue(node, self.ptr, self.globs)
+            if lv:
+                kind, base, path = lv
+                return self._inp(kind, path, base)
             return self._fresh()
         if t == "call":
             fn = node[1]
             if fn[0] == "id" and fn[1] in self.stubs:
                 return self._inp("sret", f"__sret_{fn[1]}")
-            return self._fresh()
-        if t == "index":
             return self._fresh()
         if t == "un":
             op, a = node[1], self.bv(node[2])
@@ -361,8 +410,8 @@ def _collect_decisions(body):
 # 메인: MC/DC 충족 입력 벡터 생성
 # ============================================================
 def _blank():
-    return {"fields": {}, "scalars": {}, "globals": {},
-            "srets": {}, "null": False}
+    return {"fields": {}, "scalars": {}, "globals": {}, "global_lv": {},
+            "srets": {}, "null": False, "_extern": {}}
 
 
 def collect_symbols(body):
@@ -417,16 +466,19 @@ def generate(body, const_map, ptr_name, scalar_names, globals_map,
                 continue
             assign = _blank()
             bucket = {"field": "fields", "scalar": "scalars",
-                      "global": "globals", "sret": "srets"}
+                      "global": "globals", "global_lv": "global_lv",
+                      "sret": "srets"}
             for (kind, target), var in ctx.inputs.items():
                 try:
                     val = model.eval(var, model_completion=True).as_signed_long()
                 except Exception:
                     val = 0
                 assign[bucket[kind]][target] = str(val)
+            assign["_extern"] = dict(ctx.extern)
             key = (tuple(sorted(assign["fields"].items())),
                    tuple(sorted(assign["scalars"].items())),
                    tuple(sorted(assign["globals"].items())),
+                   tuple(sorted(assign["global_lv"].items())),
                    tuple(sorted(assign["srets"].items())))
             if key in seen:
                 continue

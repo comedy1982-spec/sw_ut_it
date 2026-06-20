@@ -547,24 +547,33 @@ def _smart_vectors(params: list[dict], body: list[tuple],
             raw.append(_mk(base_ctx, [(kind, target, val)]))
 
     # ── LDRA식 Z3 미니-ATG: 결정→진리표→MC/DC 독립쌍→Z3 입력 역산 (가산) ──
-    if const_map:
-        try:
-            import swts_mcdc_atg
-            for a in swts_mcdc_atg.generate(body, const_map, ptr_name or "",
+    agg_globals: set = set()   # 집계(struct/union/array) 전역 base — 0 리셋 제외
+    try:
+        import swts_mcdc_atg
+        if swts_mcdc_atg.Z3_OK:
+            for a in swts_mcdc_atg.generate(body, const_map or {}, ptr_name or "",
                                             scalar_names, globals_map,
                                             set(stub_rets)):
                 for g in a.get("globals", {}):
                     used_globals.setdefault(g, globals_map.get(g, "int"))
+                for base, gtype in a.get("_extern", {}).items():
+                    used_globals.setdefault(base, gtype)
+                    agg_globals.add(base)
                 raw.append(a)
-        except Exception:
-            pass
+    except Exception:
+        pass
 
     vectors, seen = [], set()
     for rv in raw:
         setup, args = [], []
-        # 전역/스텁반환은 매 TC 마다 명시적으로 세팅(누수 방지)
+        # 전역: 스칼라는 매 TC 0 리셋(누수 방지), 집계 전역은 멤버 경로로만 대입
         for g in used_globals:
-            setup.append(f"{g} = {rv['globals'].get(g, '0')};")
+            if g in rv["globals"]:
+                setup.append(f"{g} = {rv['globals'][g]};")
+            elif g not in agg_globals:
+                setup.append(f"{g} = 0;")
+        for gpath, gval in rv.get("global_lv", {}).items():
+            setup.append(f"{gpath} = {gval};")
         for sname in sret_names:
             setup.append(f"{sname} = {rv.get('srets', {}).get(sname, '0')};")
         for idx, p in enumerate(params):
