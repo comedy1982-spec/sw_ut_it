@@ -6,31 +6,42 @@ echo   SWTS Studio
 echo ========================================
 echo.
 
+:: ── Python 확인 ──
 python --version > nul 2>&1
 if errorlevel 1 (
-    echo [ERROR] Python is not installed.
-    echo         Please install Python 3.9+ from https://www.python.org
+    echo [ERROR] Python not found. Install Python 3.9+ from https://www.python.org
     pause
     exit /b 1
 )
+for /f "tokens=*" %%v in ('python --version 2^>^&1') do echo [Python] %%v
+for /f "tokens=*" %%p in ('python -c "import sys; print(sys.executable)"') do echo [Path]   %%p
+echo.
 
 echo [1/4] Clearing Python cache...
 for /r %%d in (__pycache__) do (
     if exist "%%d" rd /s /q "%%d" > nul 2>&1
 )
-if exist "*.pyc" del /q "*.pyc" > nul 2>&1
 echo       Done.
 
 echo [2/4] Checking dependencies...
 python -c "import flask" > nul 2>&1
 if errorlevel 1 (
     echo       Installing Flask...
-    pip install flask > nul 2>&1
+    python -m pip install flask -q
 )
-python -c "import clang" > nul 2>&1
+
+python -c "import clang.cindex; clang.cindex.Index.create()" > nul 2>&1
 if errorlevel 1 (
     echo       Installing libclang...
-    pip install libclang > nul 2>&1
+    python -m pip install libclang -q
+    python -c "import clang.cindex; clang.cindex.Index.create()" > nul 2>&1
+    if errorlevel 1 (
+        echo [WARN] libclang 로드 실패 -- 정적 분석 모드로 실행됩니다.
+    ) else (
+        echo       libclang: OK
+    )
+) else (
+    echo       libclang: OK
 )
 echo       Done.
 
@@ -47,6 +58,7 @@ echo.
 echo   URL  : http://localhost:5000
 echo   Stop : Press Ctrl+C
 echo ========================================
+echo.
 
 set "SWTS_ROOT=%~dp0example\ecu_powertrain"
 set "PORT=5000"
