@@ -189,7 +189,14 @@ def _component_of(file_rel: str) -> Optional[str]:
         i = parts.index("src")
         if i + 1 < len(parts) - 1:
             seg = parts[i + 1]
-            return {"speed": "SpeedControl", "diag": "Diagnostics"}.get(seg, seg.capitalize())
+            return {
+                "speed":   "SpeedControl",
+                "diag":    "Diagnostics",
+                "motor":   "MotorControl",
+                "current": "CurrentSensor",
+                "encoder": "PositionEncoder",
+                "thermal": "ThermalGuard",
+            }.get(seg, seg.capitalize())
     return None
 
 

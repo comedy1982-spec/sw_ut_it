@@ -61,13 +61,26 @@ def _get_func_detail(abs_path: str, func_name: str, flags: list[str]) -> Optiona
     except cidx.TranslationUnitLoadError:
         return None
 
+    # 프로젝트 디렉터리(소스 폴더 + -I 인클루드 경로) — 시스템 헤더와 구분
+    abs_src_norm = os.path.abspath(abs_path)
+    proj_dirs = [os.path.normcase(os.path.dirname(abs_src_norm))]
+    for fl in flags:
+        if fl.startswith("-I") and len(fl) > 2:
+            proj_dirs.append(os.path.normcase(os.path.abspath(fl[2:])))
+
+    def _in_project(loc_file) -> bool:
+        if not loc_file:
+            return False
+        p = os.path.normcase(os.path.abspath(loc_file.name))
+        return any(p == d or p.startswith(d + os.sep) for d in proj_dirs)
+
     # 모든 함수 선언에서 시그니처 수집 (stub 생성용)
     #  - defined_funcs: 이 TU 에서 '정의'된 함수 (stub 금지 -> 중복정의)
-    #  - src_decls: 소스 파일에 '선언'된 함수 (정의 안 된 것은 전부 stub 필요)
-    abs_src_norm = os.path.abspath(abs_path)
+    #  - proj_decls: 프로젝트 소스/헤더에 선언된 함수 (시스템 헤더 제외)
+    #    -> 정의 안 된 것은 전부 stub (라이브러리 함수는 시스템 헤더라 제외됨)
     all_func_sigs: dict[str, dict] = {}
     defined_funcs: set = set()
-    src_decls: set = set()
+    proj_decls: set = set()
     for node in tu.cursor.walk_preorder():
         if node.kind == cidx.CursorKind.FUNCTION_DECL and node.spelling:
             all_func_sigs[node.spelling] = {
@@ -78,11 +91,10 @@ def _get_func_detail(abs_path: str, func_name: str, flags: list[str]) -> Optiona
             }
             if node.is_definition():
                 defined_funcs.add(node.spelling)
-            if (node.location.file
-                    and os.path.abspath(node.location.file.name) == abs_src_norm):
-                src_decls.add(node.spelling)
-    # 소스에 선언됐으나 정의 안 된 함수 = 반드시 stub (직접/간접 호출 무관)
-    stub_funcs = src_decls - defined_funcs
+            if _in_project(node.location.file):
+                proj_decls.add(node.spelling)
+    # 프로젝트에 선언됐으나 정의 안 된 함수 = 반드시 stub (직접/간접 호출 무관)
+    stub_funcs = proj_decls - defined_funcs
 
     # 최상위 전역변수(외부 링키지) 수집 — 하니스에서 extern 으로 세팅 가능
     all_globals: dict[str, str] = {}
@@ -202,9 +214,31 @@ def _classify_lhs(lhs, tval, fval, ptr_name, struct_var, scalar_names, globals_m
     return None  # 미지 -> 건너뜀 (설정 불가)
 
 
+def _strip_outer_parens(s: str) -> str:
+    """전체를 감싸는 균형 괄호 한 쌍만 제거 (중첩 괄호 보존).
+       예) '(a & (B|C))' -> 'a & (B|C)' (안쪽 ')' 를 떼지 않음)"""
+    s = s.strip()
+    while len(s) >= 2 and s[0] == "(" and s[-1] == ")":
+        depth = 0
+        wraps = True
+        for i, ch in enumerate(s):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and i != len(s) - 1:
+                    wraps = False
+                    break
+        if wraps:
+            s = s[1:-1].strip()
+        else:
+            break
+    return s
+
+
 def _atom_assignment(atom, ptr_name, struct_var, scalar_names, globals_map):
     """원자 조건 1개 -> (kind, target, true_value, false_value)."""
-    a = atom.strip().strip("()").strip()
+    a = _strip_outer_parens(atom.strip())
     if not a:
         return None
     if ptr_name and re.match(rf"^{re.escape(ptr_name)}\s*==\s*NULL$", a):
@@ -251,41 +285,114 @@ def _smart_vectors(params: list[dict], body: list[tuple],
     struct_var = f"_s{ptr_idx}" if ptr_idx >= 0 else None
     sret_names = [f"__sret_{f}" for f in stub_rets]
 
-    branch_re = re.compile(r"^\}?\s*(?:else\s+if|if|while|for)\s*\((.*)\)\s*\{?\s*$")
-    parsed = []
+    branch_re  = re.compile(r"^\}?\s*(?:else\s+if|if|while|for)\s*\((.*)\)\s*\{?\s*$")
+    switch_re  = re.compile(r"^switch\s*\((.*)\)\s*\{?\s*$")
+    case_re    = re.compile(r"^case\s+(.+?)\s*:.*$")
+    default_re = re.compile(r"^default\s*:.*$")
+
+    events = []   # (indent, kind, payload)
+    case_vals: dict = {}   # switch expr -> set(case values) (default 회피용)
     for _ln, text in body:
-        m = branch_re.match(text.strip())
+        st = text.strip()
+        indent = len(text) - len(text.lstrip())
+        m = branch_re.match(st)
         if m:
-            indent = len(text) - len(text.lstrip())
-            parsed.append((indent, m.group(1).strip()))
-    if not parsed:
+            events.append((indent, "branch", m.group(1).strip())); continue
+        m = switch_re.match(st)
+        if m:
+            events.append((indent, "switch", m.group(1).strip())); continue
+        m = case_re.match(st)
+        if m:
+            events.append((indent, "case", m.group(1).strip())); continue
+        if default_re.match(st):
+            events.append((indent, "default", None)); continue
+    if not events:
         return None, {}
 
     used_globals: dict = {}
+    _bucket = {"field": "fields", "scalar": "scalars",
+               "global": "globals", "sret": "srets"}
 
     def _blank():
         return {"fields": {}, "scalars": {}, "globals": {}, "srets": {}, "null": False}
+
+    def _mk(base, overrides):
+        v = {"fields": dict(base["fields"]), "scalars": dict(base["scalars"]),
+             "globals": dict(base["globals"]), "srets": dict(base.get("srets", {})),
+             "null": False}
+        for kind, tgt, val in overrides:
+            v[_bucket[kind]][tgt] = val
+        return v
+
+    def _frame(indent, assigns_dict=None, sw=None):
+        fr = {"indent": indent, "fields": {}, "scalars": {},
+              "globals": {}, "srets": {}, "sw": sw}
+        if assigns_dict:
+            for kk in ("fields", "scalars", "globals", "srets"):
+                fr[kk].update(assigns_dict.get(kk, {}))
+        return fr
+
+    def _accum(stk):
+        ctx = {"fields": {}, "scalars": {}, "globals": {}, "srets": {}}
+        for fr in stk:
+            for kk in ctx:
+                ctx[kk].update(fr[kk])
+        return ctx
 
     raw = [_blank()]                       # baseline
     if ptr_name:
         nullv = _blank(); nullv["null"] = True
         raw.append(nullv)
-    # 스텁 반환값 스윕: 각 정수형 스텁을 음수/큰양수로 -> 파생 분기 커버
+    # 스텁 반환값 스윕: 큰 음수/큰 양수로 -> 부호·임계 양방향 파생 분기 커버
     for sname in sret_names:
-        for val in ("-1", "99999"):
+        for val in ("-99999", "99999"):
             sv = _blank(); sv["srets"][sname] = val
             raw.append(sv)
 
-    stack: list = []   # (indent, ctx)
-    for indent, cond in parsed:
-        while stack and stack[-1][0] >= indent:
-            stack.pop()
-        ctx = {"fields": {}, "scalars": {}, "globals": {}}
-        for _, c in stack:
-            ctx["fields"].update(c["fields"])
-            ctx["scalars"].update(c["scalars"])
-            ctx["globals"].update(c["globals"])
+    stack: list = []   # list of frames
+    for indent, kind, payload in events:
+        # case/default 는 같은 들여쓰기의 감싸는 switch 프레임을 보존
+        if kind in ("case", "default"):
+            while stack and stack[-1]["indent"] >= indent:
+                if stack[-1].get("sw") and stack[-1]["indent"] <= indent:
+                    break
+                stack.pop()
+        else:
+            while stack and stack[-1]["indent"] >= indent:
+                stack.pop()
+        ctx = _accum(stack)
 
+        # ── switch: 자식 case 가 세팅할 변수(field/scalar/global) 결정 ──
+        if kind == "switch":
+            sw = None
+            cl = _classify_lhs(payload, "0", "0", ptr_name or "",
+                               struct_var or "", scalar_names, globals_map)
+            if cl and cl[0] in _bucket:
+                sw = (cl[0], cl[1])
+                if cl[0] == "global":
+                    used_globals[cl[1]] = globals_map.get(cl[1], "int")
+            stack.append(_frame(indent, sw=sw))
+            continue
+
+        # ── case / default: switch 변수를 해당 값으로 세팅 ──
+        if kind in ("case", "default"):
+            sw = next((fr["sw"] for fr in reversed(stack) if fr.get("sw")), None)
+            ov = []
+            if sw:
+                if kind == "case" and payload:
+                    ov = [(sw[0], sw[1], payload)]
+                    case_vals.setdefault((sw[0], sw[1]), set()).add(payload)
+                elif kind == "default":
+                    ov = [(sw[0], sw[1], "0x7FFF")]   # 어떤 case 와도 안 겹치게
+            raw.append(_mk(ctx, ov))                  # 케이스 진입 벡터
+            fr = _frame(indent)
+            for k, t, val in ov:
+                fr[_bucket[k]][t] = val
+            stack.append(fr)
+            continue
+
+        # ── branch (if / else if / while / for) ──
+        cond = payload
         has_or = "||" in cond
         assigns, null_atom = [], False
         for atom in re.split(r"\|\||&&", cond):
@@ -300,31 +407,17 @@ def _smart_vectors(params: list[dict], body: list[tuple],
                     used_globals[res[1]] = globals_map.get(res[1], "int")
                 assigns.append(res)   # (kind, target, tval, fval)
 
-        _bucket = {"field": "fields", "scalar": "scalars", "global": "globals"}
-
-        def _mk(base, overrides):
-            v = {"fields": dict(base["fields"]), "scalars": dict(base["scalars"]),
-                 "globals": dict(base["globals"]), "srets": dict(base.get("srets", {})),
-                 "null": False}
-            for kind, tgt, val in overrides:
-                v[_bucket[kind]][tgt] = val
-            return v
-
-        # 분기 진입(decision=참): 모든 원자 참
         merged = _mk(ctx, [(k, t, tv) for (k, t, tv, fv) in assigns])
-        stack.append((indent, merged))
+        stack.append(_frame(indent, merged))
 
         if null_atom:
             nv = _mk(ctx, []); nv["null"] = True
             raw.append(nv)
-
         if has_or:
-            # OR: 각 원자 단독 참(독립영향) + 모든 원자 거짓(decision=거짓)
             for k, t, tv, fv in assigns:
                 raw.append(_mk(ctx, [(k, t, tv)]))
             raw.append(_mk(ctx, [(k, t, fv) for (k, t, tv, fv) in assigns]))
         else:
-            # AND: 각 원자만 거짓(나머지 참, 독립영향)
             for i, (k, t, tv, fv) in enumerate(assigns):
                 ov = [(kk, tt, (fv2 if j == i else tv2))
                       for j, (kk, tt, tv2, fv2) in enumerate(assigns)]
@@ -365,7 +458,7 @@ def _smart_vectors(params: list[dict], body: list[tuple],
                for f, s in ((g, f"__sret_{g}") for g in stub_rets)
                if rv["srets"].get(s, "0") != "0"}
         vectors.append({"setup": setup, "args": args, "srets": srt})
-        if len(vectors) >= 48:
+        if len(vectors) >= 64:
             break
     return (vectors or None), used_globals
 
@@ -720,9 +813,11 @@ def generate(unit_ref: str, abs_src: str, func_name: str,
                 for i in range(start_ln, min(end_ln, len(_all)) + 1)]
     except OSError:
         body = []
-    # 정수형 반환 스텁 함수 목록 (반환값 스윕용)
+    # 정수형 반환 스텁 함수 중 '대상 함수가 실제 호출'하는 것만 스윕
+    # (호출 안 하는 센서까지 스윕하면 불필요한 TC 가 생김)
     _sigs = detail.get("all_sigs", {})
-    stub_rets = {f: _sigs[f]["ret"] for f in detail.get("stub_funcs", set())
+    _sweep_set = detail.get("stub_funcs", set()) & detail.get("callees", set())
+    stub_rets = {f: _sigs[f]["ret"] for f in _sweep_set
                  if f in _sigs and _sigs[f]["ret"] not in ("void",)
                  and "*" not in _sigs[f]["ret"]}
     vectors, globals_used = _smart_vectors(
