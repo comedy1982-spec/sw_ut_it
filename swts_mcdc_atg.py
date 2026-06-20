@@ -407,31 +407,45 @@ _CASE_RE = re.compile(r"^case\s+(.+?)\s*:.*$")
 _ASSIGN_RE = re.compile(r"^(?:[A-Za-z_][\w\s\*]*?\s)?([a-z_]\w*)\s*=\s*([^=].*?);")
 
 
+_ELSE_RE = re.compile(r"^\}?\s*else\b")
+_ELSE_ONLY_RE = re.compile(r"^\}?\s*else\s*\{?\s*$")
+
+
 def _collect_decisions(body):
-    """[(decision_ast, local_defs[(name,ast)], path[(ast,bool)])] 반환."""
+    """[(decision_ast, local_defs[(name,ast)], path[(ast,bool)])] 반환.
+
+    else-if 체인의 앞선 형제 조건을 '부정(False)' 경로 제약으로 누적해, 해당
+    else-if/else 본문 도달성을 정확히 모델링한다(예: `if(cmd==0){} else if(...)`
+    에서 cmd!=0 을 강제). 형제 부정이 없으면 Z3 가 cmd 를 0 으로 채워 else-if 가
+    런타임에 도달 불가가 됨."""
     decisions = []
     local_defs = []            # 누적(정의 순서)
-    stack = []                 # (indent, kind, payload) — kind: 'if'/'sw'/'case'
+    stack = []                 # 프레임: (indent, kind, cond_ast, bool) 또는 (indent,'sw_open')
     sw_expr = []               # switch 식 스택
+    chains = {}                # indent -> 현재 if/else-if 체인의 앞선 형제 조건 AST 목록
     for _ln, text in body:
         st = text.strip()
         indent = len(text) - len(text.lstrip())
         while stack and stack[-1][0] >= indent and stack[-1][1] != "sw_open":
             stack.pop()
+        for k in [k for k in chains if k > indent]:   # 더 깊은 체인 종료
+            del chains[k]
+
+        is_else = bool(_ELSE_RE.match(st))
 
         # 로컬 대입 수집
         am = _ASSIGN_RE.match(st)
-        if am and not st.startswith(("if", "while", "for", "return")):
+        if am and not st.startswith(("if", "while", "for", "return", "else", "}")):
             rast = _parse(am.group(2))
             if rast is not None:
                 local_defs.append((am.group(1), rast))
 
-        # 경로 제약(현재 스택)
-        path = [(a, b) for (_i, k, a, b) in
-                ((f[0], f[1], f[2], f[3]) for f in stack if len(f) == 4)]
+        # 경로 제약(현재 스택 프레임들)
+        path = [(f[2], f[3]) for f in stack if len(f) == 4 and f[2] is not None]
 
         m = _SW_RE.match(st)
         if m:
+            chains.pop(indent, None)
             sw_expr.append(_parse(m.group(1)))
             stack.append((indent, "sw_open"))
             continue
@@ -439,20 +453,41 @@ def _collect_decisions(body):
         if m and sw_expr and sw_expr[-1] is not None:
             cv = _parse(m.group(1))
             if cv is not None:
-                # m->mode == CASE  형태 제약
                 stack.append((indent, "case", ("bin", "==", sw_expr[-1], cv), True))
             continue
 
+        handled = False
         for rgx in (_IF_RE, _WH_RE, _DOWH_RE):
             m = rgx.match(st)
             if m:
                 dast = _parse(m.group(1))
                 if dast is not None:
+                    negs = ([(c, False) for c in chains.get(indent, [])]
+                            if (rgx is _IF_RE and is_else) else [])
                     decisions.append((dast, list(local_defs),
-                                      [p for p in path if p[0] is not None]))
-                    if rgx is _IF_RE:    # if 본문 진입 = 조건 True 경로
+                                      [p for p in (path + negs) if p[0] is not None]))
+                    if rgx is _IF_RE:
+                        for c, b in negs:                  # 형제 부정 프레임(본문 상속)
+                            stack.append((indent, "ifn", c, b))
                         stack.append((indent, "if", dast, True))
+                        if is_else:
+                            chains.setdefault(indent, []).append(dast)
+                        else:
+                            chains[indent] = [dast]        # 새 if 체인 시작
+                handled = True
                 break
+        if handled:
+            continue
+
+        # 조건 없는 `else {` : 형제 부정을 본문에 상속
+        if _ELSE_ONLY_RE.match(st):
+            for c in chains.get(indent, []):
+                stack.append((indent, "ifn", c, False))
+            chains.pop(indent, None)
+            continue
+
+        if not is_else:                                    # 일반 라인 -> 체인 종료
+            chains.pop(indent, None)
     return decisions
 
 
