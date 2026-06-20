@@ -162,6 +162,23 @@
   .tc-cb{width:13px;height:13px;flex-shrink:0;margin-top:3px;
          cursor:pointer;accent-color:var(--accent)}
   .tc-body{flex:1;min-width:0}
+
+  /* MC/DC 조건 분석 패널 */
+  .mcdc-panel{margin:6px 12px 10px;padding:8px 10px;
+              border:1px solid rgba(255,255,255,.08);border-radius:4px;
+              background:rgba(255,255,255,.02)}
+  .mcdc-title{font-size:10px;color:var(--dim);margin-bottom:5px;
+              font-weight:600;letter-spacing:.5px;font-family:var(--mono)}
+  .mcdc-record{display:flex;align-items:center;gap:5px;padding:2px 0;
+               font-size:10px;font-family:var(--mono)}
+  .mcdc-line{color:var(--dim);min-width:34px;flex-shrink:0}
+  .mcdc-conds{display:flex;gap:3px;flex-wrap:wrap}
+  .mcdc-cond{padding:1px 5px;border-radius:3px;font-weight:700;font-size:9px}
+  .mcdc-ok  {background:var(--greenbg);color:var(--green)}
+  .mcdc-miss{background:var(--redbg);color:var(--red)}
+  .mcdc-pct {color:var(--dim);margin-left:4px;font-size:9px}
+  .mcdc-dec-ok .mcdc-line{opacity:.5}
+  .badge.mcdc{background:#1a2d4a;color:#4ea1ff}
   .tc-hd{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
   .vd{width:8px;height:8px;border-radius:50%;flex-shrink:0}
   .vd.pass{background:var(--green)} .vd.fail{background:var(--red)} .vd.manual{background:var(--amber)}
@@ -582,8 +599,14 @@ document.getElementById('genBtn').onclick = async () => {
       body: JSON.stringify({unit_ref: ref, root: currentRoot})});
     const res = await r.json();
     if (res.ok) {
-      unitCov[ref] = {source: res.source, cases: res.cases, coverage: res.coverage};
+      unitCov[ref] = {source: res.source, cases: res.cases, coverage: res.coverage,
+                      mcdc_records: res.mcdc_records || [], mode: res.mode || 'mock'};
       res.cases.forEach(c => checkedTcs.add(`${ref}::${c.id}`));
+      // MC/DC 모드이면 배지 업데이트
+      if (res.mode === 'clang-mcdc') {
+        const b = document.getElementById('modeBadge');
+        b.textContent = 'MC/DC'; b.className = 'badge mcdc';
+      }
     }
   }
 
@@ -691,6 +714,32 @@ function renderTcs() {
       const x = document.createElement('div');
       x.className='note'; x.textContent='⚠ '+n; host.appendChild(x);
     });
+
+    // MC/DC 조건 분석 패널
+    const recs = data.mcdc_records || [];
+    if (recs.length > 0) {
+      const panel = document.createElement('div');
+      panel.className = 'mcdc-panel';
+      const rows = recs.map(r => {
+        const conds = (r.conditions_covered || []).map((ok, i) =>
+          `<span class="mcdc-cond ${ok ? 'mcdc-ok' : 'mcdc-miss'}">C${i+1}</span>`
+        ).join('');
+        const n  = (r.conditions_covered || []).length;
+        const cv = (r.conditions_covered || []).filter(Boolean).length;
+        const pct = n > 0 ? Math.round(100*cv/n) : 0;
+        return `<div class="mcdc-record ${r.covered?'mcdc-dec-ok':''}">
+          <span class="mcdc-line">L${r.line}</span>
+          <span class="mcdc-conds">${conds || '<span style="color:var(--dim)">–</span>'}</span>
+          <span class="mcdc-pct">${pct}%</span>
+        </div>`;
+      }).join('');
+      const uncov = recs.filter(r => !r.covered).length;
+      const badge = uncov > 0
+        ? `<span class="mcdc-cond mcdc-miss" style="float:right">${uncov}개 미충족</span>`
+        : `<span class="mcdc-cond mcdc-ok"  style="float:right">all covered</span>`;
+      panel.innerHTML = `<div class="mcdc-title">🔬 MC/DC 조건 분석 ${badge}</div>${rows}`;
+      host.appendChild(panel);
+    }
   }
 }
 

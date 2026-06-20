@@ -44,8 +44,19 @@ try:
     import swts_generate
     ENGINES = True
 except Exception as e:  # pragma: no cover
-    print(f"[warn] 엔진 로드 실패 → 목업 모드: {e}")
+    print(f"[warn] 엔진 로드 실패 -> 목업 모드: {e}")
     ENGINES = False
+
+try:
+    import swts_clang_cov
+    CLANG_COV = swts_clang_cov.tools_available()
+    if CLANG_COV:
+        print(f"[info] Clang MC/DC 엔진: {swts_clang_cov.find_clang()}")
+    else:
+        print("[info] Clang MC/DC 도구 미설치 (clang/llvm-profdata/llvm-cov) -> 정적 분석 모드")
+except Exception as e:
+    print(f"[warn] swts_clang_cov 로드 실패: {e}")
+    CLANG_COV = False
 
 
 # ============================================================
@@ -209,23 +220,22 @@ def _real_component_source(comp: str, abs_path: str) -> dict:
 
 
 def _clang_generate(unit_ref: str, root: str) -> dict | None:
-    """Clang AST 정적 분석으로 TC 스텁 생성 (GCC 없을 때)."""
+    """Clang MC/DC 실행 측정 또는 정적 분석 폴백."""
     if not ENGINES:
         return None
     root = os.path.abspath(root)
     cache = _scan_cache.get(root, {})
     if not cache:
-        # 캐시 없으면 직접 스캔
         try:
             cache = swts_scan.scan_project(root, None, ["-DUNIT_TEST"])
             _scan_cache[root] = cache
         except Exception:
             return None
 
-    # unit_ref 찾기
+    # unit_ref 에서 unit_info 찾기
     unit_info = None
     file_rel = None
-    for comp_name, comp_data in cache.get("components", {}).items():
+    for comp_data in cache.get("components", {}).values():
         for unit in comp_data.get("units", []):
             if unit["unit_ref"] == unit_ref:
                 unit_info = unit
@@ -240,8 +250,33 @@ def _clang_generate(unit_ref: str, root: str) -> dict | None:
     if not os.path.exists(abs_path):
         return None
 
-    # 함수 라인 범위 읽기
     start_ln, end_ln = [int(x) for x in unit_info["lines"].split("-")]
+    func_name = unit_info["name"]
+
+    # ── 1. Clang -fcoverage-mcdc 실행 기반 측정 (도구 있을 때) ──
+    if CLANG_COV:
+        include_dirs = []
+        inc = os.path.join(root, "include")
+        if os.path.isdir(inc):
+            include_dirs.append(inc)
+        logs: list[dict] = []
+        result = swts_clang_cov.generate(
+            unit_ref=unit_ref,
+            abs_src=abs_path,
+            func_name=func_name,
+            start_ln=start_ln,
+            end_ln=end_ln,
+            flags=["-DUNIT_TEST"],
+            include_dirs=include_dirs,
+            log=lambda lvl, t: logs.append({"level": lvl, "text": t}),
+        )
+        if result:
+            result["logs"] = logs + result.get("logs", [])
+            return result
+        # 빌드 실패 시 정적 분석으로 폴백
+        print(f"[warn] Clang MC/DC 빌드 실패 -> 정적 분석 폴백")
+
+    # ── 2. Clang 정적 분석 (도구 없거나 빌드 실패) ──
     try:
         with open(abs_path, encoding="utf-8", errors="replace") as f:
             all_lines = f.readlines()
@@ -258,7 +293,6 @@ def _clang_generate(unit_ref: str, root: str) -> dict | None:
             "is_branch": t.strip().startswith(_BRANCH_KW),
         })
 
-    func_name = unit_info["name"]
     cases = _gen_tc_stubs(func_name, source, unit_info["branches"])
     return {
         "ok": True, "unit_ref": unit_ref, "mode": "clang-static",
@@ -268,10 +302,10 @@ def _clang_generate(unit_ref: str, root: str) -> dict | None:
         "notes": [
             f"Clang AST 정적 분석: branches={unit_info['branches']}, "
             f"max_depth={unit_info['max_depth']}, support={unit_info['support']}",
-            "실제 커버리지는 GCC+gcov 필요 (현재: 정적 분석 모드)",
+            "clang + llvm-cov 설치 시 -fcoverage-mcdc 실행 기반 측정으로 자동 전환",
         ],
         "logs": [{"level": "info",
-                  "text": f"[clang] {func_name}: {unit_info['branches']}개 분기 탐지"}],
+                  "text": f"[clang-static] {func_name}: {unit_info['branches']}개 분기"}],
     }
 
 
