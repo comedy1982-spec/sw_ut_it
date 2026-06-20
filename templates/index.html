@@ -1,0 +1,970 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>SWTS Studio</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#11161d; --panel2:#161c25; --line:#222b36;
+    --text:#c9d3df; --dim:#6b7785; --accent:#4ea1ff;
+    --amber:#e3b341; --green:#3fb950; --red:#f0556a;
+    --greenbg:rgba(63,185,80,.18); --redbg:rgba(240,85,106,.15);
+    --amberbg:rgba(227,179,65,.12); --focus:rgba(78,161,255,.14);
+    --mono:ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
+    --sans:ui-sans-serif,system-ui,"Segoe UI",sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;overflow:hidden}
+  body{background:var(--bg);color:var(--text);font-family:var(--sans);display:flex;flex-direction:column}
+
+  /* ── 상단바 ── */
+  .topbar{display:flex;align-items:center;gap:12px;height:46px;flex-shrink:0;
+          padding:0 16px;background:var(--panel2);border-bottom:1px solid var(--line)}
+  .logo{font-weight:700;letter-spacing:.5px} .logo b{color:var(--accent)}
+  .sub{font-size:11px;color:var(--dim);font-family:var(--mono)}
+  .spacer{flex:1}
+  .badge{font-size:10.5px;font-family:var(--mono);padding:3px 8px;border-radius:4px;border:1px solid}
+  .badge.real{color:var(--green);border-color:var(--green)}
+  .badge.mock{color:var(--amber);border-color:var(--amber)}
+  .btn{display:inline-flex;align-items:center;gap:5px;border:none;border-radius:6px;
+       padding:7px 14px;font-size:12.5px;font-weight:600;cursor:pointer;
+       background:var(--accent);color:#0d1117;font-family:var(--sans)}
+  .btn:disabled{background:#2a3441;color:var(--dim);cursor:default}
+  .btn-sm{background:transparent;color:var(--dim);border:1px solid var(--line);
+          font-size:11px;padding:3px 8px;border-radius:4px;cursor:pointer;white-space:nowrap}
+  .btn-sm:hover{border-color:var(--accent);color:var(--accent)}
+
+  /* ── 레이아웃 ── */
+  .body{flex:1;display:flex;min-height:0}
+
+  /* ── 좌: 탐색기 ── */
+  .left{width:310px;flex-shrink:0;border-right:1px solid var(--line);
+        background:var(--panel);display:flex;flex-direction:column;min-height:0}
+
+  /* 경로 선택 바 */
+  .path-bar{flex-shrink:0;padding:8px 10px;background:var(--panel2);
+            border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:5px}
+  .path-label{font-size:10px;color:var(--dim);font-family:var(--mono);text-transform:uppercase;
+              letter-spacing:.4px;font-weight:600}
+  .path-row{display:flex;gap:5px}
+  .path-input{flex:1;background:#0d1117;border:1px solid var(--line);border-radius:4px;
+              color:var(--text);font-family:var(--mono);font-size:11px;padding:4px 7px;
+              outline:none;min-width:0}
+  .path-input:focus{border-color:var(--accent)}
+  .path-hint{font-size:10px;color:var(--dim);font-family:var(--mono);
+             white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+  /* 폴더 브라우저 드롭다운 */
+  .path-browser{position:absolute;z-index:100;background:var(--panel2);
+                border:1px solid var(--line);border-radius:6px;
+                box-shadow:0 8px 24px rgba(0,0,0,.5);
+                width:290px;max-height:260px;overflow-y:auto;display:none}
+  .path-browser.open{display:block}
+  .pb-item{padding:6px 12px;font-size:12px;font-family:var(--mono);cursor:pointer;
+           display:flex;align-items:center;gap:6px}
+  .pb-item:hover{background:var(--focus)}
+  .pb-item.up{color:var(--accent)}
+  .pb-item.dir{color:var(--text)}
+
+  /* 섹션 헤더 */
+  .phead{display:flex;align-items:center;justify-content:space-between;
+         height:32px;flex-shrink:0;padding:0 10px;
+         background:var(--panel2);border-bottom:1px solid var(--line);
+         font-size:10.5px;font-weight:600;letter-spacing:.5px;color:var(--dim);text-transform:uppercase}
+  .phead-r{display:flex;gap:4px}
+  .scroll{overflow-y:auto;flex:1;min-height:0}
+
+  /* ── 트리 ── */
+  /* 컴포넌트 */
+  .comp-block{border-bottom:1px solid var(--line)}
+  .comp-row{display:flex;align-items:center;gap:0;padding:6px 8px;
+            cursor:pointer;user-select:none;border-left:3px solid transparent}
+  .comp-row:hover{background:rgba(255,255,255,.04)}
+  .comp-row.active{background:var(--focus);border-left-color:var(--accent)}
+  .comp-toggle{width:18px;flex-shrink:0;text-align:center;font-size:9px;
+               color:var(--dim);transition:transform .12s;display:inline-block}
+  .comp-toggle.open{transform:rotate(90deg)}
+  .comp-icon{font-size:12px;margin-right:5px}
+  .comp-name{font-size:13px;font-weight:600;flex:1;min-width:0;
+             white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .comp-meta{font-size:10px;color:var(--dim);font-family:var(--mono)}
+  .comp-cnt{font-size:10px;font-family:var(--mono);color:var(--dim);
+            background:#1e2730;padding:1px 6px;border-radius:10px;margin-left:4px;flex-shrink:0}
+
+  /* 유닛 리스트 (트리 구조) */
+  .unit-list{display:none;padding:2px 0}
+  .unit-list.open{display:block}
+
+  .unit-row{display:flex;align-items:flex-start;gap:6px;
+            padding:5px 8px 5px 22px;cursor:pointer;
+            border-left:3px solid transparent}
+  .unit-row:hover{background:rgba(255,255,255,.03)}
+  .unit-row.checked{background:rgba(78,161,255,.07);border-left-color:var(--accent)}
+  .unit-row.active-nav{background:rgba(255,255,255,.05)}
+
+  /* 트리 라인 */
+  .tree-line{flex-shrink:0;width:18px;font-size:11px;color:#2a3441;
+             font-family:var(--mono);line-height:20px;padding-top:1px}
+  .unit-cb{width:13px;height:13px;flex-shrink:0;margin-top:3px;
+           cursor:pointer;accent-color:var(--accent)}
+  .unit-info{flex:1;min-width:0}
+  .unit-name{font-family:var(--mono);font-size:12px;
+             white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .unit-meta{font-size:10px;color:var(--dim);font-family:var(--mono);margin-top:1px}
+  .pill{display:inline-block;font-size:9px;font-weight:700;font-family:var(--mono);
+        padding:1px 4px;border-radius:3px;margin-left:3px;vertical-align:1px}
+  .pill.A{color:var(--green);background:var(--greenbg)}
+  .pill.B{color:var(--amber);background:var(--amberbg)}
+  .pill.C{color:var(--red);background:var(--redbg)}
+  .pill.changed{color:var(--amber);background:var(--amberbg)}
+
+  /* ── 우 ── */
+  .right{flex:1;display:flex;flex-direction:column;min-height:0}
+  .src-pane{flex:3;display:flex;flex-direction:column;min-height:0;border-bottom:1px solid var(--line)}
+  .tc-pane{flex:2;display:flex;flex-direction:column;min-height:0}
+
+  /* ── 크기 조절 핸들 ── */
+  .resizer-v{width:8px;flex-shrink:0;cursor:col-resize;background:var(--line);
+             position:relative;z-index:50;transition:background .12s;
+             display:flex;align-items:center;justify-content:center}
+  .resizer-h{height:8px;flex-shrink:0;cursor:row-resize;background:var(--line);
+             position:relative;z-index:50;transition:background .12s;
+             display:flex;align-items:center;justify-content:center}
+  .resizer-v:hover,.resizer-v.drag{background:var(--accent)}
+  .resizer-h:hover,.resizer-h.drag{background:var(--accent)}
+  /* 가운데 그립 점(항상 표시) — 핸들 위치를 명확히 */
+  .resizer-v::before{content:"";width:2px;height:26px;border-radius:2px;
+                     background:var(--dim)}
+  .resizer-h::before{content:"";height:2px;width:26px;border-radius:2px;
+                     background:var(--dim)}
+  .resizer-v:hover::before,.resizer-h:hover::before,
+  .resizer-v.drag::before,.resizer-h.drag::before{background:#0d1117}
+  /* 드래그 중 텍스트 선택/iframe 캡처 방지 */
+  body.resizing{cursor:inherit;user-select:none}
+  body.resizing *{user-select:none !important}
+
+  /* 코드뷰어 */
+  .code{font-family:var(--mono);font-size:12.5px;line-height:20px;
+        flex:1;overflow:auto;min-height:0;tab-size:4}
+  .cl{display:flex;white-space:pre;transition:background .1s}
+  .cl .gutter{width:4px;flex-shrink:0;transition:background .1s}
+  .cl.cov-full{background:var(--greenbg)} .cl.cov-full .gutter{background:var(--green)}
+  .cl.cov-none{background:var(--redbg)}  .cl.cov-none .gutter{background:var(--red)}
+  .cl.cov-partial{background:var(--amberbg)} .cl.cov-partial .gutter{background:var(--amber)}
+  .cl.cov-raw .gutter{background:transparent}
+  .cl.unit-hl{box-shadow:inset 2px 0 0 var(--accent)}
+  .cl.unit-hl-head{background:rgba(78,161,255,.12) !important;box-shadow:inset 2px 0 0 var(--accent)}
+  .cl .ft{width:28px;flex-shrink:0;text-align:center;color:var(--dim);font-size:10px;line-height:20px}
+  .cl .ft .T{color:var(--green)} .cl .ft .F{color:var(--red)}
+  .cl .hit{width:30px;flex-shrink:0;text-align:right;padding-right:5px;
+            color:var(--dim);font-size:10px;line-height:20px}
+  .cl.cov-none .hit{color:var(--red)}
+  .cl .no{width:36px;flex-shrink:0;text-align:right;padding-right:8px;
+           color:var(--dim);font-size:10px;line-height:20px}
+  .cl .tx{flex:1;padding-left:4px}
+
+  /* 칩 & 범례 */
+  .chips{display:flex;gap:5px}
+  .chip{font-size:10px;font-family:var(--mono);font-weight:600;padding:2px 7px;border-radius:4px}
+  .legend{display:flex;gap:8px;font-size:10px;font-family:var(--mono);color:var(--dim)}
+  .legend i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:3px;vertical-align:1px}
+
+  /* TC 패널 */
+  .tc-unit-sep{padding:4px 12px;font-size:10px;font-family:var(--mono);
+               color:var(--accent);background:rgba(78,161,255,.06);
+               border-bottom:1px solid rgba(78,161,255,.15);
+               display:flex;align-items:center;gap:6px}
+  .tc-cov-chips{display:flex;gap:4px;margin-left:auto}
+  .tc-chip{font-size:9px;font-family:var(--mono);font-weight:600;padding:1px 5px;border-radius:3px}
+  .tc-row{border-bottom:1px solid var(--line);padding:6px 12px;
+          display:flex;align-items:flex-start;gap:7px;cursor:pointer}
+  .tc-row:hover{background:rgba(255,255,255,.02)}
+  .tc-cb{width:13px;height:13px;flex-shrink:0;margin-top:3px;
+         cursor:pointer;accent-color:var(--accent)}
+  .tc-body{flex:1;min-width:0}
+
+  /* MC/DC 조건 분석 패널 */
+  .mcdc-panel{margin:6px 12px 10px;padding:8px 10px;
+              border:1px solid rgba(255,255,255,.08);border-radius:4px;
+              background:rgba(255,255,255,.02)}
+  .mcdc-title{font-size:10px;color:var(--dim);margin-bottom:5px;
+              font-weight:600;letter-spacing:.5px;font-family:var(--mono)}
+  .mcdc-record{display:flex;align-items:center;gap:5px;padding:2px 0;
+               font-size:10px;font-family:var(--mono)}
+  .mcdc-line{color:var(--dim);min-width:34px;flex-shrink:0}
+  .mcdc-conds{display:flex;gap:3px;flex-wrap:wrap}
+  .mcdc-cond{padding:1px 5px;border-radius:3px;font-weight:700;font-size:9px}
+  .mcdc-ok  {background:var(--greenbg);color:var(--green)}
+  .mcdc-miss{background:var(--redbg);color:var(--red)}
+  .mcdc-pct {color:var(--dim);margin-left:4px;font-size:9px}
+  .mcdc-dec-ok .mcdc-line{opacity:.5}
+  .badge.mcdc{background:#1a2d4a;color:#4ea1ff}
+  .tc-hd{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+  .vd{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+  .vd.pass{background:var(--green)} .vd.fail{background:var(--red)} .vd.manual{background:var(--amber)}
+  .tc-id{font-family:var(--mono);color:var(--accent);font-size:11px}
+  .tc-desc{font-size:11.5px}
+  .tc-kv{font-family:var(--mono);font-size:10.5px;color:var(--dim);margin-top:3px;padding-left:13px}
+  .note{padding:4px 12px;font-size:11px;color:var(--amber)}
+
+  /* 목업 안내 배너 */
+  .mock-banner{padding:5px 12px;font-size:11px;background:rgba(227,179,65,.1);
+               border-bottom:1px solid rgba(227,179,65,.25);color:var(--amber);flex-shrink:0}
+
+  .empty{height:100%;display:flex;align-items:center;justify-content:center;
+         color:var(--dim);font-size:12.5px;padding:24px;text-align:center;line-height:1.7}
+
+  ::-webkit-scrollbar{width:7px;height:7px}
+  ::-webkit-scrollbar-thumb{background:#2a3441;border-radius:4px}
+</style>
+</head>
+<body>
+
+<!-- ── 상단바 ── -->
+<div class="topbar">
+  <span class="logo"><b>SWTS</b> Studio</span>
+  <span class="sub">2-Stage · MC/DC</span>
+  <span class="spacer"></span>
+  <span id="selCount" style="font-size:11px;color:var(--dim);font-family:var(--mono)"></span>
+  <span id="modeBadge" class="badge mock">MOCK</span>
+  <button id="genBtn" class="btn" disabled>▶ TC 생성</button>
+</div>
+
+<div class="body">
+  <!-- ── 좌: 탐색기 ── -->
+  <div class="left">
+
+    <!-- 경로 선택 -->
+    <div class="path-bar" style="position:relative">
+      <div class="path-label">📁 소스 루트 경로</div>
+      <div class="path-row">
+        <input id="rootInput" class="path-input" type="text" placeholder="경로를 입력하거나 📂 클릭"/>
+        <button class="btn-sm" onclick="openBrowser()">📂</button>
+        <button class="btn-sm" onclick="doScan()">Scan</button>
+      </div>
+      <div id="pathHint" class="path-hint">–</div>
+      <!-- 폴더 브라우저 -->
+      <div id="pathBrowser" class="path-browser"></div>
+    </div>
+
+    <!-- 목업 안내 -->
+    <div id="mockBanner" class="mock-banner" style="display:none">
+      ⚠ MOCK 모드 — 실제 엔진(Clang/GCC) 없이 예제 데이터를 표시합니다.
+      실제 소스를 스캔하려면 경로를 지정하고 Scan을 누르세요.
+    </div>
+
+    <!-- 탐색기 헤더 -->
+    <div class="phead">
+      컴포넌트 / 유닛
+      <div class="phead-r">
+        <button class="btn-sm" onclick="checkAll()">전체선택</button>
+        <button class="btn-sm" onclick="uncheckAll()">해제</button>
+      </div>
+    </div>
+
+    <!-- 트리 -->
+    <div class="scroll">
+      <div id="treeInner"></div>
+    </div>
+  </div>
+
+  <!-- 좌↔우 크기 조절 핸들 -->
+  <div class="resizer-v" id="resizerLeft" title="드래그하여 폭 조절"></div>
+
+  <!-- ── 우 ── -->
+  <div class="right">
+    <!-- 소스뷰어 -->
+    <div class="src-pane">
+      <div class="phead">
+        <span id="srcTitle">📄 소스뷰어</span>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span id="legend" class="legend" style="display:none">
+            <span><i style="background:var(--green)"></i>covered</span>
+            <span><i style="background:var(--red)"></i>not covered</span>
+            <span><span style="color:var(--green)">T</span>/<span style="color:var(--red)">F</span> branch</span>
+          </span>
+          <span id="chips" class="chips"></span>
+        </div>
+      </div>
+      <div id="code" class="code">
+        <div class="empty">좌측에서 컴포넌트를 클릭하거나<br>유닛을 선택하세요.</div>
+      </div>
+    </div>
+
+    <!-- 소스뷰어↔TC 크기 조절 핸들 -->
+    <div class="resizer-h" id="resizerSrc" title="드래그하여 높이 조절"></div>
+
+    <!-- TC 패널 -->
+    <div class="tc-pane">
+      <div class="phead">
+        <span>🧪 테스트케이스
+          <span style="font-size:10px;color:var(--dim);text-transform:none;font-weight:400;margin-left:6px">
+            TC 체크박스로 커버리지 확인</span>
+        </span>
+        <div class="phead-r">
+          <button class="btn-sm" onclick="checkAllTcs()">전체선택</button>
+          <button class="btn-sm" onclick="uncheckAllTcs()">해제</button>
+        </div>
+      </div>
+      <div id="tcs" class="scroll">
+        <div class="empty">유닛을 체크 후 'TC 생성' 버튼을 누르세요.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ═══════════════════════════════════════════
+   상태
+═══════════════════════════════════════════ */
+let COMPONENTS  = {};
+let checkedGen  = new Set();   // unit_ref – TC 생성 대상
+let currentComp = null;
+let compSrc     = [];
+let unitCov     = {};          // unit_ref → {source, cases, coverage}
+let checkedTcs  = new Set();   // "unit_ref::tc_id"
+let currentRoot = '';
+let currentUnit = {start:-1, end:-1};
+
+/* ═══════════════════════════════════════════
+   초기화 (서버 준비될 때까지 최대 10회 재시도)
+═══════════════════════════════════════════ */
+(async () => {
+  for (let i = 0; i < 10; i++) {
+    try {
+      const r    = await fetch('/api/scan');
+      const data = await r.json();
+      applyData(data);
+      return;
+    } catch (e) {
+      await new Promise(res => setTimeout(res, 600));
+    }
+  }
+})();
+
+function applyData(data) {
+  COMPONENTS   = data.components || {};
+  currentRoot  = data.root || '';
+  document.getElementById('rootInput').value = currentRoot;
+  document.getElementById('pathHint').textContent = currentRoot || '–';
+
+  const isMock = !data.engines_used;
+  document.getElementById('modeBadge').textContent = isMock ? 'MOCK' : 'LIVE';
+  document.getElementById('modeBadge').className = 'badge ' + (isMock ? 'mock' : 'real');
+  document.getElementById('mockBanner').style.display = isMock ? 'block' : 'none';
+
+  checkedGen.clear(); checkedTcs.clear(); unitCov = {};
+  currentComp = null; currentUnit = {start:-1, end:-1};
+  document.getElementById('code').innerHTML =
+    '<div class="empty">좌측에서 컴포넌트를 클릭하거나<br>유닛을 선택하세요.</div>';
+  document.getElementById('tcs').innerHTML =
+    '<div class="empty">유닛을 체크 후 \'TC 생성\' 버튼을 누르세요.</div>';
+  document.getElementById('chips').innerHTML = '';
+  document.getElementById('legend').style.display = 'none';
+  updateSelCount();
+  buildTree();
+}
+
+/* ═══════════════════════════════════════════
+   경로 선택 / Scan
+═══════════════════════════════════════════ */
+async function doScan() {
+  const root = document.getElementById('rootInput').value.trim();
+  const url  = root ? `/api/scan?root=${encodeURIComponent(root)}` : '/api/scan';
+  const r    = await fetch(url);
+  const data = await r.json();
+  if (!data.ok) { alert('스캔 실패: ' + (data.error || '알 수 없는 오류')); return; }
+  applyData(data);
+}
+
+/* 폴더 브라우저 */
+async function openBrowser() {
+  const cur  = document.getElementById('rootInput').value.trim() || currentRoot;
+  const r    = await fetch(`/api/browse?path=${encodeURIComponent(cur)}`);
+  const data = await r.json();
+  renderBrowser(data);
+}
+
+function renderBrowser(data) {
+  const box = document.getElementById('pathBrowser');
+  box.innerHTML = '';
+  if (!data.ok) { box.classList.remove('open'); return; }
+
+  // 상위 폴더
+  if (data.parent && data.parent !== data.path) {
+    const up = document.createElement('div');
+    up.className = 'pb-item up';
+    up.innerHTML = '⬆ .. (상위 폴더)';
+    up.onclick = async () => {
+      const r2 = await fetch(`/api/browse?path=${encodeURIComponent(data.parent)}`);
+      renderBrowser(await r2.json());
+    };
+    box.appendChild(up);
+  }
+
+  data.dirs.forEach(d => {
+    const full = data.path.replace(/[\\/]$/, '') + '\\' + d;
+    const item = document.createElement('div');
+    item.className = 'pb-item dir';
+    item.innerHTML = `📂 ${d}`;
+    item.onclick = async (e) => {
+      e.stopPropagation();
+      const r2 = await fetch(`/api/browse?path=${encodeURIComponent(full)}`);
+      const d2 = await r2.json();
+      if (d2.dirs.length === 0) {
+        // 리프 폴더 → 선택
+        selectPath(full);
+      } else {
+        renderBrowser(d2);
+      }
+    };
+    // 더블클릭으로 선택
+    item.ondblclick = () => selectPath(full);
+    box.appendChild(item);
+  });
+
+  // 현재 폴더 선택 버튼
+  const selBtn = document.createElement('div');
+  selBtn.className = 'pb-item';
+  selBtn.style.cssText = 'border-top:1px solid var(--line);color:var(--accent);font-weight:600';
+  selBtn.innerHTML = `✔ 현재 폴더 선택: ${data.path.split(/[\\/]/).pop() || data.path}`;
+  selBtn.onclick = () => selectPath(data.path);
+  box.appendChild(selBtn);
+
+  box.classList.add('open');
+  document.addEventListener('click', closeBrowser, {once: true});
+}
+
+function selectPath(path) {
+  document.getElementById('rootInput').value = path;
+  document.getElementById('pathBrowser').classList.remove('open');
+}
+
+function closeBrowser() {
+  document.getElementById('pathBrowser').classList.remove('open');
+}
+
+document.getElementById('rootInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') doScan();
+});
+
+/* ═══════════════════════════════════════════
+   트리 빌드
+═══════════════════════════════════════════ */
+function buildTree() {
+  const host = document.getElementById('treeInner');
+  host.innerHTML = '';
+  const comps = Object.entries(COMPONENTS);
+  if (!comps.length) {
+    host.innerHTML = '<div style="padding:16px;font-size:12px;color:var(--dim);text-align:center">컴포넌트 없음</div>';
+    return;
+  }
+  comps.forEach(([name, data]) => host.appendChild(makeCompBlock(name, data)));
+}
+
+function makeCompBlock(compName, compData) {
+  const units = compData.units || [];
+  const wrap  = document.createElement('div');
+  wrap.className = 'comp-block';
+
+  /* 컴포넌트 헤더 */
+  const row = document.createElement('div');
+  row.className = 'comp-row';
+  row.dataset.comp = compName;
+
+  const toggle = document.createElement('span');
+  toggle.className = 'comp-toggle';
+  toggle.textContent = '▶';
+
+  const nameEl = document.createElement('span');
+  nameEl.className = 'comp-name';
+  nameEl.innerHTML = `<span class="comp-icon">📦</span>${compName}`;
+
+  const cnt = document.createElement('span');
+  cnt.className = 'comp-cnt';
+  cnt.textContent = units.length;
+
+  row.append(toggle, nameEl, cnt);
+
+  /* 유닛 리스트 */
+  const unitList = document.createElement('div');
+  unitList.className = 'unit-list';
+  units.forEach((u, i) => {
+    const isLast = i === units.length - 1;
+    unitList.appendChild(makeUnitRow(u, compName, isLast));
+  });
+
+  /* 컴포넌트 클릭: 접기/펼치기 + 전체 소스 표시 */
+  row.onclick = (e) => {
+    const isOpen = unitList.classList.toggle('open');
+    toggle.classList.toggle('open', isOpen);
+    // 컴포넌트 active
+    document.querySelectorAll('.comp-row').forEach(r => r.classList.remove('active'));
+    row.classList.add('active');
+    loadCompSource(compName);
+  };
+
+  wrap.append(row, unitList);
+  return wrap;
+}
+
+function makeUnitRow(u, compName, isLast) {
+  const row = document.createElement('div');
+  row.className = 'unit-row';
+  row.dataset.ref  = u.unit_ref;
+  row.dataset.comp = compName;
+  const _lineParts = (u.lines || '0-0').split('-');
+  row.dataset.startLine = _lineParts[0];
+  row.dataset.endLine   = _lineParts[1] || _lineParts[0];
+
+  /* 트리 라인 */
+  const tl = document.createElement('span');
+  tl.className = 'tree-line';
+  tl.textContent = isLast ? '└─' : '├─';
+
+  /* 체크박스 (TC 생성 선택) */
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.className = 'unit-cb';
+  cb.title = 'TC 생성 대상으로 선택';
+  cb.onclick = e => { e.stopPropagation(); toggleGenUnit(u.unit_ref, cb, row); };
+
+  /* 유닛 정보 */
+  const info = document.createElement('div');
+  info.className = 'unit-info';
+  const nm = document.createElement('div');
+  nm.className = 'unit-name';
+  nm.textContent = u.name;
+  if (u.changed) nm.innerHTML += '<span class="pill changed">CHANGED</span>';
+  const mt = document.createElement('div');
+  mt.className = 'unit-meta';
+  mt.innerHTML = `L${u.lines} · ${u.branches}br · d${u.max_depth}<span class="pill ${u.support}">Lv.${u.support}</span>`;
+  info.append(nm, mt);
+
+  row.append(tl, cb, info);
+
+  /* 유닛 행 클릭 → 컴포넌트 소스 로드 + 유닛 범위 하이라이트 */
+  row.onclick = async () => {
+    document.querySelectorAll('.unit-row').forEach(r => r.classList.remove('active-nav'));
+    row.classList.add('active-nav');
+    // 컴포넌트 트리 펼치기 + active 표시
+    const compRow = document.querySelector(`.comp-row[data-comp="${compName}"]`);
+    const ul = compRow?.nextElementSibling;
+    if (ul && !ul.classList.contains('open')) {
+      ul.classList.add('open');
+      compRow.querySelector('.comp-toggle').classList.add('open');
+    }
+    if (compRow) {
+      document.querySelectorAll('.comp-row').forEach(r => r.classList.remove('active'));
+      compRow.classList.add('active');
+    }
+    if (currentComp !== compName) await loadCompSource(compName);
+    highlightUnit(parseInt(row.dataset.startLine), parseInt(row.dataset.endLine));
+  };
+
+  return row;
+}
+
+/* ═══════════════════════════════════════════
+   체크박스 — TC 생성 대상
+═══════════════════════════════════════════ */
+function toggleGenUnit(ref, cb, row) {
+  if (cb.checked) { checkedGen.add(ref); row.classList.add('checked'); }
+  else            { checkedGen.delete(ref); row.classList.remove('checked'); }
+  updateSelCount();
+}
+function updateSelCount() {
+  const n = checkedGen.size;
+  document.getElementById('selCount').textContent = n ? `${n}개 선택  ` : '';
+  document.getElementById('genBtn').disabled = n === 0;
+}
+function checkAll() {
+  document.querySelectorAll('.unit-cb').forEach(cb => {
+    const row = cb.closest('.unit-row');
+    cb.checked = true; checkedGen.add(row.dataset.ref);
+    row.classList.add('checked');
+  });
+  updateSelCount();
+}
+function uncheckAll() {
+  document.querySelectorAll('.unit-cb').forEach(cb => {
+    cb.checked = false;
+    cb.closest('.unit-row').classList.remove('checked');
+  });
+  checkedGen.clear(); updateSelCount();
+}
+
+/* ═══════════════════════════════════════════
+   컴포넌트 소스 로드
+═══════════════════════════════════════════ */
+async function loadCompSource(compName) {
+  if (currentComp !== compName) currentUnit = {start:-1, end:-1};
+  currentComp = compName;
+  document.getElementById('srcTitle').textContent = `📄 ${compName}`;
+  document.getElementById('code').innerHTML = '<div class="empty">소스 로드 중…</div>';
+  document.getElementById('legend').style.display = 'none';
+  document.getElementById('chips').innerHTML = '';
+
+  const r   = await fetch(`/api/source?component=${encodeURIComponent(compName)}&root=${encodeURIComponent(currentRoot)}`);
+  const res = await r.json();
+  compSrc = (res.source || []).map(ln => ({...ln, cov:'raw'}));
+  renderSource();
+}
+
+/* ═══════════════════════════════════════════
+   TC 생성
+═══════════════════════════════════════════ */
+document.getElementById('genBtn').onclick = async () => {
+  if (!checkedGen.size) return;
+  const btn = document.getElementById('genBtn');
+  btn.disabled = true; btn.textContent = '⏳ 생성 중…';
+  document.getElementById('tcs').innerHTML = '';
+  document.getElementById('chips').innerHTML = '';
+
+  const refs = [...checkedGen];
+
+  // 첫 번째 유닛의 컴포넌트 자동 로드
+  const compForRef = ref => {
+    for (const [cn, cd] of Object.entries(COMPONENTS))
+      if ((cd.units||[]).some(u => u.unit_ref === ref)) return cn;
+    return null;
+  };
+  const tc = compForRef(refs[0]);
+  if (tc && currentComp !== tc) await loadCompSource(tc);
+
+  unitCov = {}; checkedTcs = new Set();
+
+  for (const ref of refs) {
+    const r   = await fetch('/api/generate', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({unit_ref: ref, root: currentRoot})});
+    const res = await r.json();
+    if (res.ok) {
+      unitCov[ref] = {source: res.source, cases: res.cases, coverage: res.coverage,
+                      mcdc_records: res.mcdc_records || [], mode: res.mode || 'mock'};
+      res.cases.forEach(c => checkedTcs.add(`${ref}::${c.id}`));
+      // MC/DC 모드이면 배지 업데이트
+      if (res.mode === 'clang-mcdc') {
+        const b = document.getElementById('modeBadge');
+        b.textContent = 'MC/DC'; b.className = 'badge mcdc';
+      }
+    }
+  }
+
+  document.getElementById('legend').style.display = 'flex';
+  renderSource();
+  renderTcs();
+  updateAggChips();
+  btn.disabled = false; btn.textContent = '▶ TC 생성';
+  updateSelCount();
+};
+
+/* ═══════════════════════════════════════════
+   커버리지 맵
+═══════════════════════════════════════════ */
+function buildCovMap() {
+  const map  = {};
+  const PRIO = {'cov-full':3,'cov-partial':2,'cov-none':1,'cov-raw':0};
+  for (const [ref, data] of Object.entries(unitCov)) {
+    for (const ln of data.source) {
+      let cls;
+      if (ln.tcs && ln.tcs.length) {
+        // TC 체크박스 매핑이 있는 경우(목업/토글) — 체크된 TC가 덮으면 full
+        const active = ln.tcs.filter(id => checkedTcs.has(`${ref}::${id}`));
+        cls = active.length > 0 ? 'cov-full' : 'cov-none';
+      } else if (ln.cov === 'full') {
+        cls = 'cov-full';   // clang 실측: 실행된 라인
+      } else if (ln.cov === 'none') {
+        cls = 'cov-none';   // clang 실측: 미실행 라인
+      } else {
+        cls = 'cov-raw';    // 비실행 라인(중괄호 등) 또는 데이터 없음
+      }
+      if (!map[ln.n] || PRIO[cls] > PRIO[map[ln.n]])
+        map[ln.n] = cls;
+    }
+  }
+  return map;
+}
+
+/* ═══════════════════════════════════════════
+   소스 렌더
+═══════════════════════════════════════════ */
+function renderSource() {
+  const host   = document.getElementById('code');
+  const covMap = buildCovMap();
+  const hasCov = Object.keys(covMap).length > 0;
+  host.innerHTML = '';
+  compSrc.forEach(ln => {
+    const cls = covMap[ln.n] || 'cov-raw';
+    const div = document.createElement('div');
+    div.className = `cl ${cls}`;
+    div.dataset.line = ln.n;
+    let ft = '';
+    if (hasCov && ln.is_branch) {
+      if (cls === 'cov-full')   ft = '<span class="T">T</span><span class="F">F</span>';
+      else if (cls==='cov-none') ft = '<span style="color:var(--dim)">T F</span>';
+    }
+    div.innerHTML =
+      `<span class="gutter"></span>` +
+      `<span class="ft">${ft}</span>` +
+      `<span class="hit"></span>` +
+      `<span class="no">${ln.n||''}</span>` +
+      `<span class="tx">${esc(ln.text)}</span>`;
+    host.appendChild(div);
+  });
+  _applyUnitHighlight();
+}
+
+/* ═══════════════════════════════════════════
+   TC 패널 렌더
+═══════════════════════════════════════════ */
+function renderTcs() {
+  const host = document.getElementById('tcs');
+  host.innerHTML = '';
+  for (const [ref, data] of Object.entries(unitCov)) {
+    const fname = ref.split('::')[1] || ref;
+    const cov   = data.coverage;
+
+    const sep = document.createElement('div');
+    sep.className = 'tc-unit-sep';
+    sep.dataset.ref = ref;
+    sep.innerHTML = `<span>▸ ${fname}  (${data.cases.length}건)</span>
+      <span class="tc-cov-chips">
+        ${tcChip('STMT',cov.statement)}${tcChip('BR',cov.branch)}${tcChip('MC/DC',cov.mcdc)}
+      </span>`;
+    host.appendChild(sep);
+
+    data.cases.forEach(tc => {
+      const row = document.createElement('div');
+      row.className = 'tc-row';
+
+      const cb = document.createElement('input');
+      cb.type = 'checkbox'; cb.className = 'tc-cb';
+      cb.checked = checkedTcs.has(`${ref}::${tc.id}`);
+      cb.onclick = e => e.stopPropagation();
+      cb.onchange = () => {
+        if (cb.checked) checkedTcs.add(`${ref}::${tc.id}`);
+        else            checkedTcs.delete(`${ref}::${tc.id}`);
+        if (unitCov[ref] && unitCov[ref].mode === 'clang-mcdc') {
+          scheduleRecompute(ref);   // 실측 모드: 선택된 TC만 백엔드 재측정
+        } else {
+          renderSource();           // 목업/토글: 프론트 즉시 반영
+        }
+      };
+
+      const body = document.createElement('div');
+      body.className = 'tc-body';
+      const kv = o => Object.entries(o||{}).map(([k,v])=>`${k}:${v}`).join(',  ');
+      body.innerHTML =
+        `<div class="tc-hd"><span class="vd ${tc.verdict}"></span>` +
+        `<span class="tc-id">${tc.id}</span>` +
+        `<span class="tc-desc">${esc(tc.desc||'')}</span></div>` +
+        `<div class="tc-kv">in { ${esc(kv(tc.inputs))} }<br>exp { ${esc(kv(tc.expected))} }</div>`;
+
+      row.onclick = () => { cb.checked = !cb.checked; cb.onchange(); };
+      cb.onclick  = e  => e.stopPropagation();
+      row.append(cb, body);
+      host.appendChild(row);
+    });
+
+    (data.notes||[]).forEach(n => {
+      const x = document.createElement('div');
+      x.className='note'; x.textContent='⚠ '+n; host.appendChild(x);
+    });
+
+    // MC/DC 조건 분석 패널
+    const recs = data.mcdc_records || [];
+    if (recs.length > 0) {
+      const panel = document.createElement('div');
+      panel.className = 'mcdc-panel';
+      const rows = recs.map(r => {
+        const conds = (r.conditions_covered || []).map((ok, i) =>
+          `<span class="mcdc-cond ${ok ? 'mcdc-ok' : 'mcdc-miss'}">C${i+1}</span>`
+        ).join('');
+        const n  = (r.conditions_covered || []).length;
+        const cv = (r.conditions_covered || []).filter(Boolean).length;
+        const pct = n > 0 ? Math.round(100*cv/n) : 0;
+        return `<div class="mcdc-record ${r.covered?'mcdc-dec-ok':''}">
+          <span class="mcdc-line">L${r.line}</span>
+          <span class="mcdc-conds">${conds || '<span style="color:var(--dim)">–</span>'}</span>
+          <span class="mcdc-pct">${pct}%</span>
+        </div>`;
+      }).join('');
+      const uncov = recs.filter(r => !r.covered).length;
+      const badge = uncov > 0
+        ? `<span class="mcdc-cond mcdc-miss" style="float:right">${uncov}개 미충족</span>`
+        : `<span class="mcdc-cond mcdc-ok"  style="float:right">all covered</span>`;
+      panel.innerHTML = `<div class="mcdc-title">🔬 MC/DC 조건 분석 ${badge}</div>${rows}`;
+      host.appendChild(panel);
+    }
+  }
+}
+
+function tcChip(label, val) {
+  const ok=val>=100, mid=val>=75;
+  const col=ok?'var(--green)':mid?'var(--amber)':'var(--red)';
+  const bg =ok?'var(--greenbg)':mid?'var(--amberbg)':'var(--redbg)';
+  return `<span class="tc-chip" style="color:${col};background:${bg}">${label} ${val}%</span>`;
+}
+
+function updateAggChips() {
+  const all = Object.values(unitCov);
+  if (!all.length) return;
+  const avg = k => Math.round(all.reduce((s,d)=>s+d.coverage[k],0)/all.length);
+  const c   = document.getElementById('chips');
+  c.innerHTML='';
+  [['STMT','statement'],['BR','branch'],['MC/DC','mcdc']].forEach(([l,k])=>{
+    const v=avg(k),ok=v>=100,mid=v>=75;
+    const col=ok?'var(--green)':mid?'var(--amber)':'var(--red)';
+    const bg =ok?'var(--greenbg)':mid?'var(--amberbg)':'var(--redbg)';
+    const s=document.createElement('span');
+    s.className='chip'; s.style.color=col; s.style.background=bg;
+    s.textContent=`${l} ${v}%`; c.appendChild(s);
+  });
+}
+
+/* 유닛별 커버리지 칩 갱신 (전체 재렌더 없이) */
+function updateUnitChips(ref) {
+  const cov = unitCov[ref] && unitCov[ref].coverage;
+  if (!cov) return;
+  const sep = document.querySelector(`.tc-unit-sep[data-ref="${ref}"] .tc-cov-chips`);
+  if (sep) sep.innerHTML =
+    `${tcChip('STMT',cov.statement)}${tcChip('BR',cov.branch)}${tcChip('MC/DC',cov.mcdc)}`;
+}
+
+/* ═══════════════════════════════════════════
+   TC 전체선택 / 해제
+═══════════════════════════════════════════ */
+function setAllTcs(checked) {
+  if (!Object.keys(unitCov).length) return;
+  for (const [ref, data] of Object.entries(unitCov)) {
+    (data.cases || []).forEach(tc => {
+      const key = `${ref}::${tc.id}`;
+      if (checked) checkedTcs.add(key); else checkedTcs.delete(key);
+    });
+  }
+  document.querySelectorAll('#tcs .tc-cb').forEach(cb => cb.checked = checked);
+  let anyClang = false;
+  for (const [ref, data] of Object.entries(unitCov)) {
+    if (data.mode === 'clang-mcdc') { anyClang = true; scheduleRecompute(ref); }
+  }
+  renderSource();                 // 목업/clang 공통 즉시 색칠 (clang 은 재측정 후 보정)
+}
+function checkAllTcs()   { setAllTcs(true);  }
+function uncheckAllTcs() { setAllTcs(false); }
+
+/* ═══════════════════════════════════════════
+   clang-mcdc: 선택된 TC만 백엔드 재측정 (정확한 STMT/BR/MC/DC)
+═══════════════════════════════════════════ */
+const _recomputeTimers = {};
+function scheduleRecompute(ref) {
+  clearTimeout(_recomputeTimers[ref]);
+  _recomputeTimers[ref] = setTimeout(() => doRecompute(ref), 250);
+}
+async function doRecompute(ref) {
+  const data = unitCov[ref];
+  if (!data) return;
+  const tcIds = data.cases.map(c => c.id).filter(id => checkedTcs.has(`${ref}::${id}`));
+  try {
+    const r = await fetch('/api/cov_select', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({unit_ref: ref, tc_ids: tcIds})});
+    const res = await r.json();
+    if (res && res.ok) {
+      data.coverage     = res.coverage;
+      data.source       = res.source;
+      data.mcdc_records = res.mcdc_records || [];
+      renderSource();
+      const tcsEl = document.getElementById('tcs');   // 칩 + MC/DC 패널 갱신
+      const sc = tcsEl.scrollTop;
+      renderTcs();
+      tcsEl.scrollTop = sc;
+      updateAggChips();
+    }
+  } catch (e) { /* 네트워크 오류 시 무시 */ }
+}
+
+/* ═══════════════════════════════════════════
+   유틸
+═══════════════════════════════════════════ */
+function highlightUnit(startLine, endLine) {
+  currentUnit = {start: startLine, end: endLine};
+  _applyUnitHighlight();
+  const el = document.querySelector(`#code .cl[data-line="${startLine}"]`);
+  if (el) el.scrollIntoView({behavior:'smooth', block:'start'});
+}
+function _applyUnitHighlight() {
+  document.querySelectorAll('#code .cl.unit-hl, #code .cl.unit-hl-head').forEach(el => {
+    el.classList.remove('unit-hl', 'unit-hl-head');
+  });
+  if (currentUnit.start < 0) return;
+  for (let ln = currentUnit.start; ln <= currentUnit.end; ln++) {
+    const el = document.querySelector(`#code .cl[data-line="${ln}"]`);
+    if (el) el.classList.add(ln === currentUnit.start ? 'unit-hl-head' : 'unit-hl');
+  }
+}
+function esc(s){
+  return (s+'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
+/* ═══════════════════════════════════════════
+   패널 크기 조절 (드래그 리사이저)
+═══════════════════════════════════════════ */
+(function initResizers(){
+  // 좌↔우: 트리 패널 폭 조절
+  const rv   = document.getElementById('resizerLeft');
+  const left = document.querySelector('.left');
+  if (rv && left) {
+    rv.addEventListener('mousedown', e => {
+      e.preventDefault();
+      const startX = e.clientX, startW = left.offsetWidth;
+      rv.classList.add('drag');
+      document.body.classList.add('resizing');
+      const move = ev => {
+        let w = startW + (ev.clientX - startX);
+        w = Math.max(180, Math.min(w, window.innerWidth - 320));
+        left.style.width = w + 'px';
+      };
+      const up = () => {
+        document.removeEventListener('mousemove', move);
+        document.removeEventListener('mouseup', up);
+        rv.classList.remove('drag');
+        document.body.classList.remove('resizing');
+      };
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', up);
+    });
+  }
+
+  // 상↔하: 소스뷰어 / TC 패널 높이 조절
+  const rh    = document.getElementById('resizerSrc');
+  const src   = document.querySelector('.src-pane');
+  const right = document.querySelector('.right');
+  if (rh && src && right) {
+    rh.addEventListener('mousedown', e => {
+      e.preventDefault();
+      const startY = e.clientY, startH = src.offsetHeight;
+      src.style.flex = 'none';          // flex 비율 → 고정 높이로 전환
+      rh.classList.add('drag');
+      document.body.classList.add('resizing');
+      const move = ev => {
+        let h = startH + (ev.clientY - startY);
+        const maxH = right.offsetHeight - 120;   // TC 패널 최소 공간 확보
+        h = Math.max(100, Math.min(h, maxH));
+        src.style.height = h + 'px';
+      };
+      const up = () => {
+        document.removeEventListener('mousemove', move);
+        document.removeEventListener('mouseup', up);
+        rh.classList.remove('drag');
+        document.body.classList.remove('resizing');
+      };
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', up);
+    });
+  }
+})();
+</script>
+</body>
+</html>
