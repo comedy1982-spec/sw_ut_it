@@ -866,16 +866,26 @@ def parse_cov(cov_data: dict, src_basename: str,
         files[0] if files else {}
     )
 
-    # 라인별 실행 횟수 (segments에서 추출) — 소스뷰어 색칠용 (파일 전체)
+    # 라인별 실행 횟수 (segments에서 추출) — llvm-cov 라인 카운트 의미를 반영.
+    #   세그먼트: [line, col, count, has_count, is_region_entry, is_gap_region]
+    #   라인 카운트 = max(그 라인에서 시작하는 region-entry 카운트,
+    #                    라인 시점에 활성(wrapped)인 리전 카운트).
+    #   gap-region(폴스루 표시) 세그먼트는 자체 카운트로 라인을 올리지 않고,
+    #   이월 카운트(wrapped)를 사용한다 → switch case 의 break 라인 등이
+    #   '직전 케이스 본문 카운트'로 올바르게 covered 처리됨(0-count gap 아티팩트 제거).
     line_hits: dict[int, int] = {}
-    prev_count = 0
+    wrapped = 0                       # 직전 리전(비-gap)의 카운트 — 라인 경계로 이월
     for seg in target.get("segments", []):
-        # [line, col, count, has_count, is_region_entry, is_gap_region]
-        if len(seg) >= 4:
-            line, has_count, count = seg[0], seg[3], seg[2]
-            if has_count:
-                prev_count = count
-            line_hits.setdefault(line, prev_count)
+        if len(seg) < 4:
+            continue
+        line, count, has_count = seg[0], seg[2], seg[3]
+        is_entry = bool(seg[4]) if len(seg) >= 5 else False
+        is_gap = bool(seg[5]) if len(seg) >= 6 else False
+        # 이 라인 카운트 후보: region-entry(비-gap)면 자기 count, 아니면 이월 wrapped
+        cand = count if (has_count and is_entry and not is_gap) else wrapped
+        line_hits[line] = max(line_hits.get(line, 0), cand)
+        if has_count:                 # 이월 갱신(후보 계산 후)
+            wrapped = count
 
     # ── 함수 단위 스코핑 (가능하면) — 대상 함수만의 STMT/BR/MC/DC ──
     fn = None
