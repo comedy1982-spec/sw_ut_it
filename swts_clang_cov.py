@@ -334,6 +334,7 @@ def _smart_vectors(params: list[dict], body: list[tuple],
     local_deps = _local_deps(body, ptr_name or "", scalar_names, set(stub_rets))
 
     branch_re  = re.compile(r"^\}?\s*(?:else\s+if|if|while|for)\s*\((.*)\)\s*\{?\s*$")
+    dowhile_re = re.compile(r"^\}?\s*while\s*\((.*)\)\s*;\s*$")   # do-while 종료조건
     switch_re  = re.compile(r"^switch\s*\((.*)\)\s*\{?\s*$")
     case_re    = re.compile(r"^case\s+(.+?)\s*:.*$")
     default_re = re.compile(r"^default\s*:.*$")
@@ -366,6 +367,10 @@ def _smart_vectors(params: list[dict], body: list[tuple],
             is_loop = st.startswith(("while", "for"))
             events.append((indent, "branch", m.group(1).strip(),
                            _is_guard(i) and not is_loop))
+            continue
+        m = dowhile_re.match(st)        # } while(cond); -> 분기로 취급(루프 종료 결정)
+        if m:
+            events.append((indent, "branch", m.group(1).strip(), False))
             continue
         m = switch_re.match(st)
         if m:
@@ -421,6 +426,7 @@ def _smart_vectors(params: list[dict], body: list[tuple],
     # 가드 통과 전제조건 (early-return 가드의 부정) — 이후 모든 벡터의 base
     precond = {"fields": {}, "scalars": {}, "globals": {}, "srets": {}}
 
+    rel_seeds: list = []   # (base_ctx, kind, target, rhs) — 관계비교 경계값 시딩용
     stack: list = []   # list of frames
     for indent, kind, payload, is_guard in events:
         # case/default 는 같은 들여쓰기의 감싸는 switch 프레임을 보존
@@ -471,6 +477,14 @@ def _smart_vectors(params: list[dict], body: list[tuple],
         has_or = "||" in cond
         assigns, null_atom, derived = [], False, []
         for atom in re.split(r"\|\||&&", cond):
+            # 관계비교(field/scalar/global op CONST) -> 경계값 시딩 대상으로 수집
+            _cm = _CMP_RE.match(_strip_outer_parens(atom.strip()))
+            if _cm and _cm.group(2) in ("<", ">", "<=", ">="):
+                _rhs = _cm.group(3).strip()
+                _cl = _classify_lhs(_cm.group(1).strip(), "", "", ptr_name or "",
+                                    struct_var or "", scalar_names, globals_map)
+                if _cl and _cl[0] in _bucket and _SAFE_CONST.match(_rhs):
+                    rel_seeds.append((ctx, _cl[0], _cl[1], _rhs))
             res = _atom_assignment(atom, ptr_name or "", struct_var or "",
                                    scalar_names, globals_map)
             if res:
@@ -520,6 +534,14 @@ def _smart_vectors(params: list[dict], body: list[tuple],
         if is_guard and "&&" not in cond and assigns:
             for k, t, tv, fv in assigns:
                 precond[_bucket[k]][t] = fv
+
+    # ── 관계비교 변수 경계값 시딩 ──
+    # 단일 if 뿐 아니라 do-while/복합조건의 재평가(본문이 값을 변형한 뒤 재검사)까지
+    # 커버하도록, 비교 상수의 ±2배 너머 값을 함께 주입한다(래핑 루프 등).
+    for base_ctx, kind, target, rhs in rel_seeds:
+        for val in (f"((2*({rhs}))+9)", f"(({rhs})+1)",
+                    f"(({rhs})-1)", f"((-2*({rhs}))-9)"):
+            raw.append(_mk(base_ctx, [(kind, target, val)]))
 
     vectors, seen = [], set()
     for rv in raw:
