@@ -271,9 +271,15 @@
 
     <!-- TC 패널 -->
     <div class="tc-pane">
-      <div class="phead">🧪 테스트케이스
-        <span style="font-size:10px;color:var(--dim);text-transform:none;font-weight:400;margin-left:6px">
-          TC 체크박스로 커버리지 확인</span>
+      <div class="phead">
+        <span>🧪 테스트케이스
+          <span style="font-size:10px;color:var(--dim);text-transform:none;font-weight:400;margin-left:6px">
+            TC 체크박스로 커버리지 확인</span>
+        </span>
+        <div class="phead-r">
+          <button class="btn-sm" onclick="checkAllTcs()">전체선택</button>
+          <button class="btn-sm" onclick="uncheckAllTcs()">해제</button>
+        </div>
       </div>
       <div id="tcs" class="scroll">
         <div class="empty">유닛을 체크 후 'TC 생성' 버튼을 누르세요.</div>
@@ -800,6 +806,27 @@ function updateUnitChips(ref) {
   if (sep) sep.innerHTML =
     `${tcChip('STMT',cov.statement)}${tcChip('BR',cov.branch)}${tcChip('MC/DC',cov.mcdc)}`;
 }
+
+/* ═══════════════════════════════════════════
+   TC 전체선택 / 해제
+═══════════════════════════════════════════ */
+function setAllTcs(checked) {
+  if (!Object.keys(unitCov).length) return;
+  for (const [ref, data] of Object.entries(unitCov)) {
+    (data.cases || []).forEach(tc => {
+      const key = `${ref}::${tc.id}`;
+      if (checked) checkedTcs.add(key); else checkedTcs.delete(key);
+    });
+  }
+  document.querySelectorAll('#tcs .tc-cb').forEach(cb => cb.checked = checked);
+  let anyClang = false;
+  for (const [ref, data] of Object.entries(unitCov)) {
+    if (data.mode === 'clang-mcdc') { anyClang = true; scheduleRecompute(ref); }
+  }
+  renderSource();                 // 목업/clang 공통 즉시 색칠 (clang 은 재측정 후 보정)
+}
+function checkAllTcs()   { setAllTcs(true);  }
+function uncheckAllTcs() { setAllTcs(false); }
 
 /* ═══════════════════════════════════════════
    clang-mcdc: 선택된 TC만 백엔드 재측정 (정확한 STMT/BR/MC/DC)
