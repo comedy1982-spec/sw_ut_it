@@ -567,7 +567,7 @@ def _emit_harness(func_name: str, detail: dict, vectors: list[dict],
                   globals_used: dict, include_dirs: list[str], abs_src: str) -> str:
     L = ["/* SWTS auto-generated harness for Clang MC/DC */",
          "#include <stdio.h>", "#include <stddef.h>", "#include <string.h>",
-         "#include <stdlib.h>", ""]
+         "#include <stdlib.h>", "#include <stdint.h>", ""]
 
     # 소스에 대응하는 헤더 include
     src_stem = os.path.splitext(os.path.basename(abs_src))[0]
