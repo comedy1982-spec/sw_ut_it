@@ -226,8 +226,10 @@ def _atom_assignment(atom, ptr_name, struct_var, scalar_names, globals_map):
 
 
 def _smart_vectors(params: list[dict], body: list[tuple],
-                   globals_map: dict) -> tuple:
+                   globals_map: dict, stub_rets: dict) -> tuple:
     """함수 본문 분기 조건을 분석해 도달성 높은 테스트 벡터 생성.
+       stub_rets: {정수형 스텁함수: 반환타입} — 반환값을 극단값으로 쓸어
+       스텁이 만든 로컬변수에 의존하는 분기(raw<0, kmh>MAX 등)를 커버.
        반환: (vectors, used_globals{name:type}) — 실패 시 (None, {})."""
     ptr_name = ptr_type = None
     ptr_idx = -1
@@ -244,9 +246,10 @@ def _smart_vectors(params: list[dict], body: list[tuple],
                 ptr_name, ptr_type, ptr_idx = n, base, idx
         else:
             scalar_names[n] = idx
-    if ptr_name is None and not scalar_names:
+    if ptr_name is None and not scalar_names and not stub_rets:
         return None, {}
     struct_var = f"_s{ptr_idx}" if ptr_idx >= 0 else None
+    sret_names = [f"__sret_{f}" for f in stub_rets]
 
     branch_re = re.compile(r"^\}?\s*(?:else\s+if|if|while|for)\s*\((.*)\)\s*\{?\s*$")
     parsed = []
@@ -261,12 +264,17 @@ def _smart_vectors(params: list[dict], body: list[tuple],
     used_globals: dict = {}
 
     def _blank():
-        return {"fields": {}, "scalars": {}, "globals": {}, "null": False}
+        return {"fields": {}, "scalars": {}, "globals": {}, "srets": {}, "null": False}
 
     raw = [_blank()]                       # baseline
     if ptr_name:
         nullv = _blank(); nullv["null"] = True
         raw.append(nullv)
+    # 스텁 반환값 스윕: 각 정수형 스텁을 음수/큰양수로 -> 파생 분기 커버
+    for sname in sret_names:
+        for val in ("-1", "99999"):
+            sv = _blank(); sv["srets"][sname] = val
+            raw.append(sv)
 
     stack: list = []   # (indent, ctx)
     for indent, cond in parsed:
@@ -296,7 +304,8 @@ def _smart_vectors(params: list[dict], body: list[tuple],
 
         def _mk(base, overrides):
             v = {"fields": dict(base["fields"]), "scalars": dict(base["scalars"]),
-                 "globals": dict(base["globals"]), "null": False}
+                 "globals": dict(base["globals"]), "srets": dict(base.get("srets", {})),
+                 "null": False}
             for kind, tgt, val in overrides:
                 v[_bucket[kind]][tgt] = val
             return v
@@ -325,9 +334,11 @@ def _smart_vectors(params: list[dict], body: list[tuple],
     vectors, seen = [], set()
     for rv in raw:
         setup, args = [], []
-        # 전역변수는 매 TC 마다 명시적으로 세팅(누수 방지)
+        # 전역/스텁반환은 매 TC 마다 명시적으로 세팅(누수 방지)
         for g in used_globals:
             setup.append(f"{g} = {rv['globals'].get(g, '0')};")
+        for sname in sret_names:
+            setup.append(f"{sname} = {rv.get('srets', {}).get(sname, '0')};")
         for idx, p in enumerate(params):
             n = p["name"]
             if idx == ptr_idx:
@@ -349,7 +360,11 @@ def _smart_vectors(params: list[dict], body: list[tuple],
         if key in seen:
             continue
         seen.add(key)
-        vectors.append({"setup": setup, "args": args})
+        # 스텁 반환값(기본 0 아님)을 입력 표시용으로 노출
+        srt = {f"{f}()": rv["srets"].get(s, "0")
+               for f, s in ((g, f"__sret_{g}") for g in stub_rets)
+               if rv["srets"].get(s, "0") != "0"}
+        vectors.append({"setup": setup, "args": args, "srets": srt})
         if len(vectors) >= 48:
             break
     return (vectors or None), used_globals
@@ -398,8 +413,13 @@ def _emit_harness(func_name: str, detail: dict, vectors: list[dict],
             plist = ", ".join(parts)
         if ret == "void":
             L.append(f"void {callee}({plist}) {{ }}")
-        else:
+        elif "*" in ret:
+            # 포인터 반환 스텁 -> NULL 고정 (잘못된 포인터 역참조 방지)
             L.append(f"{ret} {callee}({plist}) {{ return ({ret})0; }}")
+        else:
+            # 정수형 반환 스텁 -> 세팅 가능한 전역 반환 (분기 제어용)
+            L.append(f"{ret} __sret_{callee} = ({ret})0;")
+            L.append(f"{ret} {callee}({plist}) {{ return __sret_{callee}; }}")
     L.append("")
 
     # main() — 테스트 벡터 기반 (각 TC 를 블록으로 감싸 변수 스코프 분리)
@@ -700,8 +720,13 @@ def generate(unit_ref: str, abs_src: str, func_name: str,
                 for i in range(start_ln, min(end_ln, len(_all)) + 1)]
     except OSError:
         body = []
+    # 정수형 반환 스텁 함수 목록 (반환값 스윕용)
+    _sigs = detail.get("all_sigs", {})
+    stub_rets = {f: _sigs[f]["ret"] for f in detail.get("stub_funcs", set())
+                 if f in _sigs and _sigs[f]["ret"] not in ("void",)
+                 and "*" not in _sigs[f]["ret"]}
     vectors, globals_used = _smart_vectors(
-        detail["params"], body, detail.get("all_globals", {}))
+        detail["params"], body, detail.get("all_globals", {}), stub_rets)
     if not vectors:
         vectors, globals_used = _gen_vectors(detail["params"]), {}
     log("info", f"[clang-mcdc] 테스트 벡터 {len(vectors)}개 생성"
@@ -766,7 +791,8 @@ def generate(unit_ref: str, abs_src: str, func_name: str,
         cases = [
             {"id": f"TC-{i:03d}", "verdict": "manual",
              "desc": f"Auto vec #{i} - {', '.join(v['args'])}",
-             "inputs": {p["name"]: a for p, a in zip(detail["params"], v["args"])},
+             "inputs": {**{p["name"]: a for p, a in zip(detail["params"], v["args"])},
+                        **v.get("srets", {})},
              "expected": ({"return": ret_map[i]} if i in ret_map else {})}
             for i, v in enumerate(vectors, 1)
         ]
