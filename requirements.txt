@@ -1,3 +1,4 @@
 flask>=3.0
 libclang>=16.0
 gcovr>=7.0
+z3-solver>=4.12   # 선택: LDRA식 MC/DC 미니-ATG(없어도 정상 동작, 자동 비활성)

@@ -306,10 +306,13 @@ def _atom_assignment(atom, ptr_name, struct_var, scalar_names, globals_map):
 
 
 def _smart_vectors(params: list[dict], body: list[tuple],
-                   globals_map: dict, stub_rets: dict) -> tuple:
+                   globals_map: dict, stub_rets: dict,
+                   const_map: dict | None = None) -> tuple:
     """함수 본문 분기 조건을 분석해 도달성 높은 테스트 벡터 생성.
        stub_rets: {정수형 스텁함수: 반환타입} — 반환값을 극단값으로 쓸어
        스텁이 만든 로컬변수에 의존하는 분기(raw<0, kmh>MAX 등)를 커버.
+       const_map: {매크로/enum: 정수값} — 주어지면 Z3 미니-ATG 로 MC/DC
+       독립쌍을 풀어 입력 벡터를 추가(가산식).
        반환: (vectors, used_globals{name:type}) — 실패 시 (None, {})."""
     ptr_name = ptr_type = None
     ptr_idx = -1
@@ -543,6 +546,19 @@ def _smart_vectors(params: list[dict], body: list[tuple],
                     f"(({rhs})-1)", f"((-2*({rhs}))-9)"):
             raw.append(_mk(base_ctx, [(kind, target, val)]))
 
+    # ── LDRA식 Z3 미니-ATG: 결정→진리표→MC/DC 독립쌍→Z3 입력 역산 (가산) ──
+    if const_map:
+        try:
+            import swts_mcdc_atg
+            for a in swts_mcdc_atg.generate(body, const_map, ptr_name or "",
+                                            scalar_names, globals_map,
+                                            set(stub_rets)):
+                for g in a.get("globals", {}):
+                    used_globals.setdefault(g, globals_map.get(g, "int"))
+                raw.append(a)
+        except Exception:
+            pass
+
     vectors, seen = [], set()
     for rv in raw:
         setup, args = [], []
@@ -694,6 +710,78 @@ def build(clang: str, harness: str, src_file: str,
     if proc.returncode != 0:
         raise RuntimeError(f"clang build failed:\n{proc.stderr[-2000:]}")
     return exe
+
+
+def probe_consts(symbols, abs_src: str, include_dirs: list[str],
+                 clang: str) -> dict:
+    """조건에 등장하는 대문자 상수/매크로/enum 값을 clang 컴파일+실행으로 해석.
+    {SYM: int} 반환. 실패 시 {} (ATG 는 그래도 일부 조건은 풀거나 건너뜀)."""
+    syms = sorted(symbols or [])
+    if not clang or not syms:
+        return {}
+    wd = tempfile.mkdtemp(prefix="swts_probe_")
+    try:
+        L = ["#include <stdio.h>", "#include <stdint.h>"]
+        src_stem = os.path.splitext(os.path.basename(abs_src))[0]
+        seen_h = set()
+        for inc in include_dirs:
+            for h in (src_stem + ".h", "hw_api.h"):
+                hp = os.path.join(inc, h)
+                if hp not in seen_h and os.path.exists(hp):
+                    L.append(f'#include "{hp}"')
+                    seen_h.add(hp)
+        # .c 의 object-like 매크로도 주입(헤더에 없는 .c 로컬 매크로 대비)
+        try:
+            with open(abs_src, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    dm = re.match(r"\s*#\s*define\s+([A-Za-z_]\w*)\s+(\S.*?)\s*$", line)
+                    if dm:
+                        L.append(f"#ifndef {dm.group(1)}")
+                        L.append(f"#define {dm.group(1)} {dm.group(2)}")
+                        L.append("#endif")
+        except OSError:
+            pass
+        head = "\n".join(L)
+        probe_c = os.path.join(wd, "probe.c")
+        exe = os.path.join(wd, "probe.exe" if os.name == "nt" else "probe")
+        cmd = [clang, "-O0", "-o", exe, probe_c, "-Wno-everything"]
+        for inc in include_dirs:
+            cmd += ["-I", inc]
+        # 미정의 식별자(enum 아닌 비상수 등)는 컴파일러 에러에서 추출해 제거 후 재시도
+        cur = list(syms)
+        r = None
+        for _attempt in range(4):
+            prog = head + "\nint main(void){\n" + "".join(
+                f'  printf("{s}=%lld\\n",(long long)({s}));\n' for s in cur
+            ) + "  return 0; }\n"
+            with open(probe_c, "w", encoding="utf-8") as f:
+                f.write(prog)
+            try:
+                p = subprocess.run(cmd, cwd=wd, capture_output=True, text=True, timeout=40)
+            except Exception:
+                return {}
+            if p.returncode == 0:
+                try:
+                    r = subprocess.run([exe], cwd=wd, capture_output=True,
+                                       text=True, timeout=10)
+                except Exception:
+                    return {}
+                break
+            bad = set(re.findall(r"undeclared identifier '([A-Za-z_]\w*)'", p.stderr))
+            bad |= set(re.findall(r"undeclared\b.*?'([A-Za-z_]\w*)'", p.stderr))
+            cur = [s for s in cur if s not in bad]
+            if not bad or not cur:
+                return {}
+        if r is None:
+            return {}
+        out = {}
+        for line in r.stdout.splitlines():
+            m = re.match(r"^([A-Za-z_]\w*)=(-?\d+)$", line.strip())
+            if m:
+                out[m.group(1)] = int(m.group(2))
+        return out
+    finally:
+        shutil.rmtree(wd, ignore_errors=True)
 
 
 # ============================================================
@@ -953,12 +1041,23 @@ def generate(unit_ref: str, abs_src: str, func_name: str,
     stub_rets = {f: _sigs[f]["ret"] for f in _sweep_set
                  if f in _sigs and _sigs[f]["ret"] not in ("void",)
                  and "*" not in _sigs[f]["ret"]}
+    # 조건에 쓰인 매크로/enum 값을 clang 으로 해석 -> Z3 미니-ATG 입력
+    const_map = {}
+    try:
+        import swts_mcdc_atg
+        if swts_mcdc_atg.Z3_OK:
+            const_map = probe_consts(swts_mcdc_atg.collect_symbols(body),
+                                     abs_src, include_dirs, clang)
+    except Exception:
+        const_map = {}
     vectors, globals_used = _smart_vectors(
-        detail["params"], body, detail.get("all_globals", {}), stub_rets)
+        detail["params"], body, detail.get("all_globals", {}), stub_rets,
+        const_map)
     if not vectors:
         vectors, globals_used = _gen_vectors(detail["params"]), {}
     log("info", f"[clang-mcdc] 테스트 벡터 {len(vectors)}개 생성"
-                + (f" (전역 {len(globals_used)}개 세팅)" if globals_used else ""))
+                + (f" (전역 {len(globals_used)}개 세팅)" if globals_used else "")
+                + (f" · Z3-ATG 상수 {len(const_map)}개" if const_map else ""))
 
     workdir = tempfile.mkdtemp(prefix="swts_mcdc_")
     keep_workdir = False
