@@ -18,6 +18,7 @@ gcov 대비: if (a && (b || c)) 에서 각 조건이 결과를 독립으로 바�
 from __future__ import annotations
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -179,15 +180,24 @@ def _emit_harness(func_name: str, detail: dict,
             L.append(f"{ret} {callee}({plist}) {{ return ({ret})0; }}")
     L.append("")
 
-    # main() — 테스트 벡터 기반
+    # main() — 테스트 벡터 기반 (각 TC 를 블록으로 감싸 변수 스코프 분리)
+    # 반환값을 stdout 으로 출력 -> 상위에서 expected 실측값으로 파싱
+    ret_type = (detail.get("ret_type") or "int").strip()
+    is_void  = ret_type == "void"
     vectors = _gen_vectors(detail["params"])
     L.append("int main(void) {")
     for i, vec in enumerate(vectors, 1):
         L.append(f"  /* TC-{i:03d} */")
+        L.append("  {")
         for stmt in vec["setup"]:
-            L.append(f"  {stmt}")
+            L.append(f"    {stmt}")
         call_args = ", ".join(vec["args"])
-        L.append(f"  {func_name}({call_args});")
+        if is_void:
+            L.append(f"    {func_name}({call_args});")
+        else:
+            L.append(f'    printf("__RET{i}=%lld\\n", '
+                     f"(long long)({func_name}({call_args})));")
+        L.append("  }")
     L.append("  return 0;")
     L.append("}")
     return "\n".join(L)
@@ -198,7 +208,8 @@ def _emit_harness(func_name: str, detail: dict,
 # ============================================================
 def build(clang: str, harness: str, src_file: str,
           workdir: str, include_dirs: list[str]) -> str:
-    exe = os.path.join(workdir, "testbin")
+    # Windows 에서는 .exe 확장자를 명시해야 run/llvm-cov 가 같은 파일을 가리킴
+    exe = os.path.join(workdir, "testbin.exe" if os.name == "nt" else "testbin")
     cmd = [
         clang, "-O0", "-g",
         "-fprofile-instr-generate",
@@ -219,13 +230,13 @@ def build(clang: str, harness: str, src_file: str,
 # ============================================================
 # 6. 실행 + 프로파일 수집
 # ============================================================
-def run_collect(exe: str, workdir: str) -> str:
+def run_collect(exe: str, workdir: str) -> tuple[str, str]:
     profraw = os.path.join(workdir, "run.profraw")
     env = os.environ.copy()
     env["LLVM_PROFILE_FILE"] = profraw
-    subprocess.run([exe], cwd=workdir, env=env,
-                   capture_output=True, text=True, timeout=30)
-    return profraw
+    proc = subprocess.run([exe], cwd=workdir, env=env,
+                          capture_output=True, text=True, timeout=30)
+    return profraw, (proc.stdout or "")
 
 
 # ============================================================
@@ -349,7 +360,10 @@ def generate(unit_ref: str, abs_src: str, func_name: str,
 
     log("info", f"[clang-mcdc] 도구: {clang}")
 
-    detail = _get_func_detail(abs_src, func_name, flags)
+    # AST 파싱에도 include 경로를 넘겨야 헤더 타입이 해석되어
+    # 모든 분기/피호출 함수(callee)가 정확히 수집됨
+    ast_flags = list(flags) + [f"-I{d}" for d in include_dirs]
+    detail = _get_func_detail(abs_src, func_name, ast_flags)
     if not detail:
         log("warn", f"[clang-mcdc] {func_name} AST 추출 실패")
         return None
@@ -366,7 +380,13 @@ def generate(unit_ref: str, abs_src: str, func_name: str,
         exe = build(clang, harness_path, abs_src, workdir, include_dirs)
 
         log("info", "[clang-mcdc] 실행 + profraw 수집")
-        profraw = run_collect(exe, workdir)
+        profraw, stdout = run_collect(exe, workdir)
+        # 하니스가 출력한 실측 반환값 파싱: __RET<i>=<value>
+        ret_map: dict[int, int] = {}
+        for line in stdout.splitlines():
+            m = re.match(r"__RET(\d+)=(-?\d+)", line.strip())
+            if m:
+                ret_map[int(m.group(1))] = int(m.group(2))
 
         log("info", "[clang-mcdc] llvm-profdata merge")
         profdata = merge_profile(profdata_tool, profraw, workdir)
@@ -383,13 +403,13 @@ def generate(unit_ref: str, abs_src: str, func_name: str,
 
         source = build_source(abs_src, start_ln, end_ln, cov["line_hits"])
 
-        # 자동 생성 TC 목록
+        # 자동 생성 TC 목록 (expected = 하니스 실측 반환값)
         vectors = _gen_vectors(detail["params"])
         cases = [
             {"id": f"TC-{i:03d}", "verdict": "manual",
              "desc": f"Auto vec #{i} - {', '.join(v['args'])}",
              "inputs": {p["name"]: a for p, a in zip(detail["params"], v["args"])},
-             "expected": {}}
+             "expected": ({"return": ret_map[i]} if i in ret_map else {})}
             for i, v in enumerate(vectors, 1)
         ]
 

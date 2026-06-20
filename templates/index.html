@@ -133,7 +133,8 @@
   .cl.cov-none{background:var(--redbg)}  .cl.cov-none .gutter{background:var(--red)}
   .cl.cov-partial{background:var(--amberbg)} .cl.cov-partial .gutter{background:var(--amber)}
   .cl.cov-raw .gutter{background:transparent}
-  .cl.unit-hl{outline:1px solid rgba(78,161,255,.5)}
+  .cl.unit-hl{box-shadow:inset 2px 0 0 var(--accent)}
+  .cl.unit-hl-head{background:rgba(78,161,255,.12) !important;box-shadow:inset 2px 0 0 var(--accent)}
   .cl .ft{width:28px;flex-shrink:0;text-align:center;color:var(--dim);font-size:10px;line-height:20px}
   .cl .ft .T{color:var(--green)} .cl .ft .F{color:var(--red)}
   .cl .hit{width:30px;flex-shrink:0;text-align:right;padding-right:5px;
@@ -292,6 +293,7 @@ let compSrc     = [];
 let unitCov     = {};          // unit_ref → {source, cases, coverage}
 let checkedTcs  = new Set();   // "unit_ref::tc_id"
 let currentRoot = '';
+let currentUnit = {start:-1, end:-1};
 
 /* ═══════════════════════════════════════════
    초기화 (서버 준비될 때까지 최대 10회 재시도)
@@ -321,7 +323,7 @@ function applyData(data) {
   document.getElementById('mockBanner').style.display = isMock ? 'block' : 'none';
 
   checkedGen.clear(); checkedTcs.clear(); unitCov = {};
-  currentComp = null;
+  currentComp = null; currentUnit = {start:-1, end:-1};
   document.getElementById('code').innerHTML =
     '<div class="empty">좌측에서 컴포넌트를 클릭하거나<br>유닛을 선택하세요.</div>';
   document.getElementById('tcs').innerHTML =
@@ -468,7 +470,7 @@ function makeCompBlock(compName, compData) {
     // 컴포넌트 active
     document.querySelectorAll('.comp-row').forEach(r => r.classList.remove('active'));
     row.classList.add('active');
-    if (isOpen) loadCompSource(compName);
+    loadCompSource(compName);
   };
 
   wrap.append(row, unitList);
@@ -480,7 +482,9 @@ function makeUnitRow(u, compName, isLast) {
   row.className = 'unit-row';
   row.dataset.ref  = u.unit_ref;
   row.dataset.comp = compName;
-  row.dataset.startLine = (u.lines || '0').split('-')[0];
+  const _lineParts = (u.lines || '0-0').split('-');
+  row.dataset.startLine = _lineParts[0];
+  row.dataset.endLine   = _lineParts[1] || _lineParts[0];
 
   /* 트리 라인 */
   const tl = document.createElement('span');
@@ -508,25 +512,23 @@ function makeUnitRow(u, compName, isLast) {
 
   row.append(tl, cb, info);
 
-  /* 유닛 행 클릭 → 컴포넌트 소스 + 해당 라인으로 스크롤 */
+  /* 유닛 행 클릭 → 컴포넌트 소스 로드 + 유닛 범위 하이라이트 */
   row.onclick = async () => {
     document.querySelectorAll('.unit-row').forEach(r => r.classList.remove('active-nav'));
     row.classList.add('active-nav');
-    if (currentComp !== compName) {
-      // 컴포넌트도 열기
-      const compRow = document.querySelector(`.comp-row[data-comp="${compName}"]`);
-      const unitList = compRow?.nextElementSibling;
-      if (unitList && !unitList.classList.contains('open')) {
-        unitList.classList.add('open');
-        compRow.querySelector('.comp-toggle').classList.add('open');
-        compRow.classList.add('active');
-        document.querySelectorAll('.comp-row').forEach(r => {
-          if (r !== compRow) r.classList.remove('active');
-        });
-      }
-      await loadCompSource(compName);
+    // 컴포넌트 트리 펼치기 + active 표시
+    const compRow = document.querySelector(`.comp-row[data-comp="${compName}"]`);
+    const ul = compRow?.nextElementSibling;
+    if (ul && !ul.classList.contains('open')) {
+      ul.classList.add('open');
+      compRow.querySelector('.comp-toggle').classList.add('open');
     }
-    scrollToLine(parseInt(row.dataset.startLine), true);
+    if (compRow) {
+      document.querySelectorAll('.comp-row').forEach(r => r.classList.remove('active'));
+      compRow.classList.add('active');
+    }
+    if (currentComp !== compName) await loadCompSource(compName);
+    highlightUnit(parseInt(row.dataset.startLine), parseInt(row.dataset.endLine));
   };
 
   return row;
@@ -565,6 +567,7 @@ function uncheckAll() {
    컴포넌트 소스 로드
 ═══════════════════════════════════════════ */
 async function loadCompSource(compName) {
+  if (currentComp !== compName) currentUnit = {start:-1, end:-1};
   currentComp = compName;
   document.getElementById('srcTitle').textContent = `📄 ${compName}`;
   document.getElementById('code').innerHTML = '<div class="empty">소스 로드 중…</div>';
@@ -668,6 +671,7 @@ function renderSource() {
       `<span class="tx">${esc(ln.text)}</span>`;
     host.appendChild(div);
   });
+  _applyUnitHighlight();
 }
 
 /* ═══════════════════════════════════════════
@@ -776,13 +780,20 @@ function updateAggChips() {
 /* ═══════════════════════════════════════════
    유틸
 ═══════════════════════════════════════════ */
-function scrollToLine(lineNo, hl) {
-  const el = document.querySelector(`#code .cl[data-line="${lineNo}"]`);
-  if (!el) return;
-  el.scrollIntoView({behavior:'smooth', block:'start'});
-  if (hl) {
-    el.classList.add('unit-hl');
-    setTimeout(()=>el.classList.remove('unit-hl'), 1800);
+function highlightUnit(startLine, endLine) {
+  currentUnit = {start: startLine, end: endLine};
+  _applyUnitHighlight();
+  const el = document.querySelector(`#code .cl[data-line="${startLine}"]`);
+  if (el) el.scrollIntoView({behavior:'smooth', block:'start'});
+}
+function _applyUnitHighlight() {
+  document.querySelectorAll('#code .cl.unit-hl, #code .cl.unit-hl-head').forEach(el => {
+    el.classList.remove('unit-hl', 'unit-hl-head');
+  });
+  if (currentUnit.start < 0) return;
+  for (let ln = currentUnit.start; ln <= currentUnit.end; ln++) {
+    const el = document.querySelector(`#code .cl[data-line="${ln}"]`);
+    if (el) el.classList.add(ln === currentUnit.start ? 'unit-hl-head' : 'unit-hl');
   }
 }
 function esc(s){

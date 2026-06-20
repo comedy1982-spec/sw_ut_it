@@ -18,6 +18,7 @@ SWTS Studio — Flask 단일 파일 버전 (순수 Python + 서버렌더 HTML)
 from __future__ import annotations
 import os
 import sys
+import re
 import json
 
 from flask import Flask, render_template, request, jsonify
@@ -294,7 +295,8 @@ def _clang_generate(unit_ref: str, root: str) -> dict | None:
             "is_branch": t.strip().startswith(_BRANCH_KW),
         })
 
-    cases = _gen_tc_stubs(func_name, source, unit_info["branches"])
+    cases = _gen_tc_stubs(func_name, source, unit_info["branches"],
+                          abs_path=abs_path, flags=["-DUNIT_TEST"])
     return {
         "ok": True, "unit_ref": unit_ref, "mode": "clang-static",
         "coverage": {"statement": 0, "branch": 0, "mcdc": 0},
@@ -310,23 +312,136 @@ def _clang_generate(unit_ref: str, root: str) -> dict | None:
     }
 
 
-def _gen_tc_stubs(func_name: str, source: list, branch_count: int) -> list:
-    """분기 분석으로 TC 스텁 생성."""
-    branch_lines = [(ln["n"], ln["text"].strip()) for ln in source if ln["is_branch"]]
-    cases = [{"id": "TC-001", "verdict": "manual",
-              "desc": f"{func_name} 정상 경로 (기본 입력)", "inputs": {}, "expected": {}}]
-    for i, (ln_no, text) in enumerate(branch_lines[:9], 2):
-        # 조건식 추출 (if (...) 형식)
-        cond = text
-        for prefix in ("if (", "while (", "for (", "} else if ("):
-            if text.startswith(prefix):
-                inner = text[len(prefix):]
-                rp = inner.rfind(")")
-                cond = inner[:rp] if rp >= 0 else inner
-                break
+def _extract_cond(text: str) -> str:
+    """if/while/for/else if 라인에서 조건식만 추출."""
+    text = text.strip()
+    for prefix in ("} else if (", "else if (", "if (", "while (", "for ("):
+        if text.startswith(prefix):
+            inner = text[len(prefix):]
+            rp = inner.rfind(")")
+            return inner[:rp] if rp >= 0 else inner
+    return text
+
+
+_ARROW = ""  # '->' 보호용 임시 토큰 (비교연산자 '>' 와 혼동 방지)
+
+
+def _parse_condition(cond: str) -> dict:
+    """C 조건식을 {좌변: 값힌트} 로 분해 (분기를 트리거하는 입력 추정).
+       예) 's == NULL || s->id < 0' -> {'s':'NULL', 's->id':'< 0'}"""
+    hints: dict = {}
+    # '->' 의 '>' 가 비교연산자로 오인되지 않도록 negative lookbehind 사용
+    op_re = re.compile(r"^(.+?)\s*(==|!=|<=|>=|<|(?<!-)>)\s*(.+)$")
+    for part in re.split(r"\|\||&&", cond):
+        part = part.strip().strip("()").strip()
+        if not part:
+            continue
+        m = op_re.match(part)
+        if m:
+            lhs, op, rhs = m.group(1).strip(), m.group(2), m.group(3).strip()
+            if op == "==":
+                hints[lhs] = rhs
+            elif op == "!=":
+                hints[lhs] = f"!= {rhs}"
+            else:
+                hints[lhs] = f"{op} {rhs}"
+        else:  # 단순 truthiness: 'flag' 또는 '!flag'
+            if part.startswith("!"):
+                hints[part[1:].strip()] = "0 (false)"
+            else:
+                hints[part] = "!= 0 (true)"
+    return hints
+
+
+def _branch_return(source: list, bi: int) -> str | None:
+    """분기 라인(source[bi]) 블록 안에서 첫 return 값을 추출."""
+    depth = 0
+    seen_brace = False
+    for k in range(bi, len(source)):
+        t = source[k]["text"]
+        depth += t.count("{") - t.count("}")
+        if "{" in t:
+            seen_brace = True
+        st = t.strip()
+        if k > bi and st.startswith("return"):
+            val = st[len("return"):].strip().rstrip(";").strip()
+            return val or "(void)"
+        if seen_brace and k > bi and depth <= 0:
+            break
+    return None
+
+
+def _nominal_inputs(params: list) -> dict:
+    """파라미터 타입별 정상 경로 기본 입력값."""
+    out: dict = {}
+    for p in params:
+        t, n = p.get("type", ""), p.get("name", "")
+        if "*" in t:
+            out[n] = "buf" if any(b in t for b in ("char", "int", "short")) else "&valid"
+        elif any(x in t for x in ("int", "long", "short", "char")):
+            out[n] = "0"
+        else:  # enum 등
+            out[n] = "0"
+    return out
+
+
+def _gen_tc_stubs(func_name: str, source: list, branch_count: int,
+                  abs_path: str | None = None, flags: list | None = None) -> list:
+    """분기 + 함수 시그니처 분석으로 입력/기대값이 채워진 TC 생성."""
+    # 1) libclang 으로 파라미터 추출 (런타임 도구 없이 AST 만으로 가능)
+    params: list = []
+    if abs_path:
+        try:
+            import swts_clang_cov
+            detail = swts_clang_cov._get_func_detail(abs_path, func_name, flags or [])
+            if detail:
+                params = detail.get("params", [])
+        except Exception:
+            params = []
+    nominal = _nominal_inputs(params)
+
+    # 2) 함수의 마지막(fall-through) return → 정상 경로 기대값
+    returns = [ln["text"].strip() for ln in source
+               if ln["text"].strip().startswith("return")]
+    final_ret = None
+    if returns:
+        final_ret = returns[-1][len("return"):].strip().rstrip(";").strip() or "(void)"
+
+    # 3) TC-001: 정상 경로
+    cases = [{
+        "id": "TC-001", "verdict": "manual",
+        "desc": f"{func_name} 정상 경로 (nominal)",
+        "inputs": nominal or {"(args)": "none"},
+        "expected": {"return": final_ret} if final_ret else {"return": "정상 동작"},
+    }]
+
+    # 4) 분기별 TC: 조건을 트리거하는 입력 + 해당 분기의 return
+    branch_indices = [i for i, ln in enumerate(source) if ln["is_branch"]]
+    for n, bi in enumerate(branch_indices[:9], 2):
+        raw = source[bi]["text"].strip()
+        ret = _branch_return(source, bi)
+        inputs = dict(nominal)
+
+        if raw.startswith("case "):                       # switch-case
+            val  = raw[5:].rstrip(":").strip()
+            desc = f"case {val}"
+            inputs["(case)"] = val
+        elif raw.startswith("default"):                   # switch-default
+            desc = "default (기본 케이스)"
+        elif "else" in raw and "if" not in raw:           # 순수 else
+            desc = "else (기본 경로)"
+        else:                                             # if / else if / while / for
+            cond = _extract_cond(raw)
+            inputs.update(_parse_condition(cond))         # 분기 트리거 입력으로 덮어쓰기
+            desc = cond[:48]
+
+        if not inputs:
+            inputs = {"(args)": "none"}
         cases.append({
-            "id": f"TC-{i:03d}", "verdict": "manual",
-            "desc": f"L{ln_no}: {cond[:50]}", "inputs": {}, "expected": {},
+            "id": f"TC-{n:03d}", "verdict": "manual",
+            "desc": f"L{source[bi]['n']}: {desc}",
+            "inputs": inputs,
+            "expected": {"return": ret} if ret else {"return": final_ret or "?"},
         })
     return cases
 
