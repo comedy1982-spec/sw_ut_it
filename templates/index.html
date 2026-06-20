@@ -636,8 +636,18 @@ function buildCovMap() {
   const PRIO = {'cov-full':3,'cov-partial':2,'cov-none':1,'cov-raw':0};
   for (const [ref, data] of Object.entries(unitCov)) {
     for (const ln of data.source) {
-      const active = ln.tcs.filter(id => checkedTcs.has(`${ref}::${id}`));
-      const cls    = active.length > 0 ? 'cov-full' : 'cov-none';
+      let cls;
+      if (ln.tcs && ln.tcs.length) {
+        // TC 체크박스 매핑이 있는 경우(목업/토글) — 체크된 TC가 덮으면 full
+        const active = ln.tcs.filter(id => checkedTcs.has(`${ref}::${id}`));
+        cls = active.length > 0 ? 'cov-full' : 'cov-none';
+      } else if (ln.cov === 'full') {
+        cls = 'cov-full';   // clang 실측: 실행된 라인
+      } else if (ln.cov === 'none') {
+        cls = 'cov-none';   // clang 실측: 미실행 라인
+      } else {
+        cls = 'cov-raw';    // 비실행 라인(중괄호 등) 또는 데이터 없음
+      }
       if (!map[ln.n] || PRIO[cls] > PRIO[map[ln.n]])
         map[ln.n] = cls;
     }

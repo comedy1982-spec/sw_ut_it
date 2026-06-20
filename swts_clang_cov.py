@@ -145,9 +145,179 @@ def _gen_vectors(params: list[dict]) -> list[dict]:
 
 
 # ============================================================
+# 3-b. 조건 인식(condition-aware) 테스트 벡터 생성
+#  - 분기 조건을 파싱해 구조체 필드/파라미터를 "트리거 값"으로 설정
+#  - 들여쓰기로 상위 분기 조건을 누적해 깊은 분기까지 도달
+# ============================================================
+_CMP_RE = re.compile(r"^(.+?)\s*(==|!=|<=|>=|<|(?<!-)>)\s*(.+)$")
+
+
+def _op_values(op: str, rhs: str) -> tuple:
+    """조건 `lhs op rhs` 의 (참으로 만드는 값, 거짓으로 만드는 값)."""
+    rhs = rhs.strip()
+    plus, minus = f"(({rhs}) + 1)", f"(({rhs}) - 1)"
+    return {
+        "<":  (minus, rhs),
+        ">":  (plus,  rhs),
+        "<=": (rhs,   plus),
+        ">=": (rhs,   minus),
+        "==": (rhs,   plus),
+        "!=": (plus,  rhs),
+    }.get(op, (rhs, plus))
+
+
+def _classify_lhs(lhs, tval, fval, ptr_name, struct_var, scalar_names):
+    lhs = lhs.strip()
+    if ptr_name and lhs.startswith(ptr_name + "->"):
+        field = lhs[len(ptr_name) + 2:].strip()
+        if re.match(r"^[A-Za-z_]\w*$", field):
+            return ("field", field, tval, fval)
+        return None
+    if lhs in scalar_names:
+        return ("scalar", lhs, tval, fval)
+    return None  # 전역변수/미지 -> 건너뜀 (설정 불가)
+
+
+def _atom_assignment(atom, ptr_name, struct_var, scalar_names):
+    """원자 조건 1개 -> (kind, target, true_value, false_value)."""
+    a = atom.strip().strip("()").strip()
+    if not a:
+        return None
+    if ptr_name and re.match(rf"^{re.escape(ptr_name)}\s*==\s*NULL$", a):
+        return ("null", ptr_name, "NULL", "")
+    if ptr_name and re.match(rf"^{re.escape(ptr_name)}\s*!=\s*NULL$", a):
+        return ("notnull", ptr_name, "", "")
+    m = _CMP_RE.match(a)
+    if m:
+        lhs, op, rhs = m.group(1).strip(), m.group(2), m.group(3).strip()
+        tval, fval = _op_values(op, rhs)
+        return _classify_lhs(lhs, tval, fval, ptr_name, struct_var, scalar_names)
+    m = re.match(r"^(.+?)\s*&\s*(.+)$", a)        # 비트 AND: lhs & mask
+    if m:
+        return _classify_lhs(m.group(1).strip(), m.group(2).strip(), "0",
+                             ptr_name, struct_var, scalar_names)
+    if a.startswith("!"):                          # !x  -> true:0 false:1
+        return _classify_lhs(a[1:].strip(), "0", "1", ptr_name, struct_var, scalar_names)
+    return _classify_lhs(a, "1", "0", ptr_name, struct_var, scalar_names)  # x -> true:1
+
+
+def _smart_vectors(params: list[dict], body: list[tuple]) -> Optional[list[dict]]:
+    """함수 본문 분기 조건을 분석해 도달성 높은 테스트 벡터 생성."""
+    ptr_name = ptr_type = None
+    ptr_idx = -1
+    scalar_names: dict = {}
+    basic_ptrs: dict = {}
+    for idx, p in enumerate(params):
+        t = p["type"].replace("const", "").strip()
+        n = p["name"]
+        if "*" in t:
+            base = t.replace("*", "").strip()
+            if base in ("int", "char", "unsigned char", "short"):
+                basic_ptrs[idx] = n
+            elif ptr_name is None:
+                ptr_name, ptr_type, ptr_idx = n, base, idx
+        else:
+            scalar_names[n] = idx
+    if ptr_name is None and not scalar_names:
+        return None
+    struct_var = f"_s{ptr_idx}" if ptr_idx >= 0 else None
+
+    branch_re = re.compile(r"^\}?\s*(?:else\s+if|if|while|for)\s*\((.*)\)\s*\{?\s*$")
+    parsed = []
+    for _ln, text in body:
+        m = branch_re.match(text.strip())
+        if m:
+            indent = len(text) - len(text.lstrip())
+            parsed.append((indent, m.group(1).strip()))
+    if not parsed:
+        return None
+
+    raw = [{"fields": {}, "scalars": {}, "null": False}]   # baseline
+    if ptr_name:
+        raw.append({"fields": {}, "scalars": {}, "null": True})
+
+    stack: list = []   # (indent, ctx)
+    for indent, cond in parsed:
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        ctx_f, ctx_s = {}, {}
+        for _, c in stack:
+            ctx_f.update(c["fields"]); ctx_s.update(c["scalars"])
+
+        has_or = "||" in cond
+        assigns, null_atom = [], False
+        for atom in re.split(r"\|\||&&", cond):
+            res = _atom_assignment(atom, ptr_name or "", struct_var or "", scalar_names)
+            if not res:
+                continue
+            if res[0] == "null":
+                null_atom = True
+            elif res[0] != "notnull":
+                assigns.append(res)   # (kind, target, tval, fval)
+
+        def _mk(base_f, base_s, overrides):
+            v = {"fields": dict(base_f), "scalars": dict(base_s), "null": False}
+            for kind, tgt, val in overrides:
+                (v["fields"] if kind == "field" else v["scalars"])[tgt] = val
+            return v
+
+        # 분기 진입(decision=참): 모든 원자 참
+        all_true = [(k, t, tv) for (k, t, tv, fv) in assigns]
+        merged_f, merged_s = dict(ctx_f), dict(ctx_s)
+        for kind, tgt, val in all_true:
+            (merged_f if kind == "field" else merged_s)[tgt] = val
+        stack.append((indent, {"fields": merged_f, "scalars": merged_s}))
+
+        if null_atom:
+            raw.append({"fields": dict(ctx_f), "scalars": dict(ctx_s), "null": True})
+
+        if has_or:
+            # OR: 각 원자 단독 참(독립영향) + 모든 원자 거짓(decision=거짓)
+            for k, t, tv, fv in assigns:
+                raw.append(_mk(ctx_f, ctx_s, [(k, t, tv)]))
+            raw.append(_mk(ctx_f, ctx_s, [(k, t, fv) for (k, t, tv, fv) in assigns]))
+        else:
+            # AND: 각 원자만 거짓(나머지 참, 독립영향)
+            for i, (k, t, tv, fv) in enumerate(assigns):
+                ov = [(kk, tt, (fv2 if j == i else tv2))
+                      for j, (kk, tt, tv2, fv2) in enumerate(assigns)]
+                raw.append(_mk(ctx_f, ctx_s, ov))
+        raw.append({"fields": dict(merged_f), "scalars": dict(merged_s), "null": False})
+
+    vectors, seen = [], set()
+    for rv in raw:
+        setup, args = [], []
+        for idx, p in enumerate(params):
+            n = p["name"]
+            if idx == ptr_idx:
+                if rv["null"]:
+                    args.append("NULL")
+                else:
+                    setup.append(f"{ptr_type} {struct_var}; "
+                                 f"memset(&{struct_var}, 0, sizeof({struct_var}));")
+                    for field, val in rv["fields"].items():
+                        setup.append(f"{struct_var}.{field} = {val};")
+                    args.append(f"&{struct_var}")
+            elif idx in basic_ptrs:
+                buf = f"_buf{idx}"
+                setup.append(f"int {buf}[8] = {{0}};")
+                args.append(buf)
+            else:
+                args.append(str(rv["scalars"].get(n, "0")))
+        key = (tuple(setup), tuple(args))
+        if key in seen:
+            continue
+        seen.add(key)
+        vectors.append({"setup": setup, "args": args})
+        if len(vectors) >= 48:
+            break
+    return vectors or None
+
+
+# ============================================================
 # 4. harness.c 생성
 # ============================================================
-def _emit_harness(func_name: str, detail: dict,
+def _emit_harness(func_name: str, detail: dict, vectors: list[dict],
                   include_dirs: list[str], abs_src: str) -> str:
     L = ["/* SWTS auto-generated harness for Clang MC/DC */",
          "#include <stdio.h>", "#include <stddef.h>", "#include <string.h>", ""]
@@ -184,7 +354,6 @@ def _emit_harness(func_name: str, detail: dict,
     # 반환값을 stdout 으로 출력 -> 상위에서 expected 실측값으로 파싱
     ret_type = (detail.get("ret_type") or "int").strip()
     is_void  = ret_type == "void"
-    vectors = _gen_vectors(detail["params"])
     L.append("int main(void) {")
     for i, vec in enumerate(vectors, 1):
         L.append(f"  /* TC-{i:03d} */")
@@ -368,10 +537,21 @@ def generate(unit_ref: str, abs_src: str, func_name: str,
         log("warn", f"[clang-mcdc] {func_name} AST 추출 실패")
         return None
 
+    # 함수 본문 라인 -> 조건 인식 벡터 생성 (실패 시 단순 조합으로 폴백)
+    try:
+        with open(abs_src, encoding="utf-8", errors="replace") as f:
+            _all = f.readlines()
+        body = [(i, _all[i - 1].rstrip("\n"))
+                for i in range(start_ln, min(end_ln, len(_all)) + 1)]
+    except OSError:
+        body = []
+    vectors = _smart_vectors(detail["params"], body) or _gen_vectors(detail["params"])
+    log("info", f"[clang-mcdc] 테스트 벡터 {len(vectors)}개 생성")
+
     workdir = tempfile.mkdtemp(prefix="swts_mcdc_")
     try:
         # harness 생성
-        harness_code = _emit_harness(func_name, detail, include_dirs, abs_src)
+        harness_code = _emit_harness(func_name, detail, vectors, include_dirs, abs_src)
         harness_path = os.path.join(workdir, "harness.c")
         with open(harness_path, "w", encoding="utf-8") as f:
             f.write(harness_code)
@@ -404,7 +584,6 @@ def generate(unit_ref: str, abs_src: str, func_name: str,
         source = build_source(abs_src, start_ln, end_ln, cov["line_hits"])
 
         # 자동 생성 TC 목록 (expected = 하니스 실측 반환값)
-        vectors = _gen_vectors(detail["params"])
         cases = [
             {"id": f"TC-{i:03d}", "verdict": "manual",
              "desc": f"Auto vec #{i} - {', '.join(v['args'])}",
