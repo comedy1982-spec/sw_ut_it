@@ -184,6 +184,8 @@ def _gen_vectors(params: list[dict]) -> list[dict]:
 #  - 들여쓰기로 상위 분기 조건을 누적해 깊은 분기까지 도달
 # ============================================================
 _CMP_RE = re.compile(r"^(.+?)\s*(==|!=|<=|>=|<|(?<!-)>)\s*(.+)$")
+# 상수/매크로(대문자) 만 — 파생 스윕 값으로 안전하게 사용 가능
+_SAFE_CONST = re.compile(r"^-?[A-Z0-9_][A-Z0-9_ +\-*/()]*$")
 
 
 def _op_values(op: str, rhs: str) -> tuple:
@@ -236,6 +238,50 @@ def _strip_outer_parens(s: str) -> str:
     return s
 
 
+def _local_deps(body, ptr_name, scalar_names, stub_names):
+    """로컬변수 -> 제어 가능한 base 집합. base=(kind,target):
+       'scalar'(param) / 'field'(struct) / 'sret'(스텁 반환).
+       예) int raw=read_sensor(); int kmh=raw*36/10; -> kmh 는 read_sensor 반환에 의존."""
+    assigns_of: dict = {}    # local -> [rhs, ...] (모든 대입)
+    assign_re = re.compile(r"^(?:[A-Za-z_][\w\s\*]*?\s)?([A-Za-z_]\w*)\s*=\s*([^=].*?);")
+    for _ln, text in body:
+        m = assign_re.match(text.strip())
+        if m:
+            assigns_of.setdefault(m.group(1), []).append(m.group(2))
+
+    ident_re = re.compile(r"[A-Za-z_]\w*")
+    field_re = re.compile(rf"{re.escape(ptr_name)}\s*->\s*(\w+)") if ptr_name else None
+    call_re  = re.compile(r"([A-Za-z_]\w*)\s*\(")
+    cache: dict = {}
+
+    def resolve(local, seen):
+        if local in cache:
+            return cache[local]
+        if local not in assigns_of or local in seen:
+            return set()
+        seen.add(local)
+        bases: set = set()
+        for rhs in assigns_of[local]:
+            for cm in call_re.finditer(rhs):
+                if cm.group(1) in stub_names:
+                    bases.add(("sret", f"__sret_{cm.group(1)}"))
+            # 함수호출 인자목록 제거 -> 호출 인자(sensor_id 등)를 의존성으로 오인 방지
+            work = re.sub(r"[A-Za-z_]\w*\s*\([^()]*\)", " ", rhs)
+            if field_re:
+                for fm in field_re.finditer(work):
+                    bases.add(("field", fm.group(1)))
+            for im in ident_re.finditer(work):
+                nm = im.group(0)
+                if nm in scalar_names:
+                    bases.add(("scalar", nm))
+                elif nm in assigns_of and nm != local:
+                    bases |= resolve(nm, seen)
+        cache[local] = bases
+        return bases
+
+    return {lc: resolve(lc, set()) for lc in assigns_of}
+
+
 def _atom_assignment(atom, ptr_name, struct_var, scalar_names, globals_map):
     """원자 조건 1개 -> (kind, target, true_value, false_value)."""
     a = _strip_outer_parens(atom.strip())
@@ -284,28 +330,51 @@ def _smart_vectors(params: list[dict], body: list[tuple],
         return None, {}
     struct_var = f"_s{ptr_idx}" if ptr_idx >= 0 else None
     sret_names = [f"__sret_{f}" for f in stub_rets]
+    # 로컬변수 의존성 (delta=t-duty, hottest=read_temp_raw() 등 추적)
+    local_deps = _local_deps(body, ptr_name or "", scalar_names, set(stub_rets))
 
     branch_re  = re.compile(r"^\}?\s*(?:else\s+if|if|while|for)\s*\((.*)\)\s*\{?\s*$")
     switch_re  = re.compile(r"^switch\s*\((.*)\)\s*\{?\s*$")
     case_re    = re.compile(r"^case\s+(.+?)\s*:.*$")
     default_re = re.compile(r"^default\s*:.*$")
 
-    events = []   # (indent, kind, payload)
+    exit_re = re.compile(r"\b(return|break|continue|goto)\b")
+    texts = [t for _l, t in body]
+
+    def _is_guard(i):
+        """body[i] 의 if 가 가드(본문이 return/break 등으로 탈출)인지."""
+        if exit_re.search(texts[i]):       # 한 줄 가드: if (G) return x;
+            return True
+        base = len(texts[i]) - len(texts[i].lstrip())
+        for j in range(i + 1, min(i + 4, len(texts))):
+            s = texts[j].strip()
+            if not s or s in ("{", "}"):
+                continue
+            ind = len(texts[j]) - len(texts[j].lstrip())
+            if ind <= base:                # 본문 끝(같거나 얕은 들여쓰기)
+                return False
+            return bool(exit_re.search(s))
+        return False
+
+    events = []   # (indent, kind, payload, is_guard)
     case_vals: dict = {}   # switch expr -> set(case values) (default 회피용)
-    for _ln, text in body:
+    for i, text in enumerate(texts):
         st = text.strip()
         indent = len(text) - len(text.lstrip())
         m = branch_re.match(st)
         if m:
-            events.append((indent, "branch", m.group(1).strip())); continue
+            is_loop = st.startswith(("while", "for"))
+            events.append((indent, "branch", m.group(1).strip(),
+                           _is_guard(i) and not is_loop))
+            continue
         m = switch_re.match(st)
         if m:
-            events.append((indent, "switch", m.group(1).strip())); continue
+            events.append((indent, "switch", m.group(1).strip(), False)); continue
         m = case_re.match(st)
         if m:
-            events.append((indent, "case", m.group(1).strip())); continue
+            events.append((indent, "case", m.group(1).strip(), False)); continue
         if default_re.match(st):
-            events.append((indent, "default", None)); continue
+            events.append((indent, "default", None, False)); continue
     if not events:
         return None, {}
 
@@ -349,8 +418,11 @@ def _smart_vectors(params: list[dict], body: list[tuple],
             sv = _blank(); sv["srets"][sname] = val
             raw.append(sv)
 
+    # 가드 통과 전제조건 (early-return 가드의 부정) — 이후 모든 벡터의 base
+    precond = {"fields": {}, "scalars": {}, "globals": {}, "srets": {}}
+
     stack: list = []   # list of frames
-    for indent, kind, payload in events:
+    for indent, kind, payload, is_guard in events:
         # case/default 는 같은 들여쓰기의 감싸는 switch 프레임을 보존
         if kind in ("case", "default"):
             while stack and stack[-1]["indent"] >= indent:
@@ -360,7 +432,10 @@ def _smart_vectors(params: list[dict], body: list[tuple],
         else:
             while stack and stack[-1]["indent"] >= indent:
                 stack.pop()
-        ctx = _accum(stack)
+        ctx = {kk: dict(precond[kk]) for kk in precond}    # 전제조건을 base 로
+        acc = _accum(stack)
+        for kk in ctx:
+            ctx[kk].update(acc[kk])
 
         # ── switch: 자식 case 가 세팅할 변수(field/scalar/global) 결정 ──
         if kind == "switch":
@@ -394,18 +469,26 @@ def _smart_vectors(params: list[dict], body: list[tuple],
         # ── branch (if / else if / while / for) ──
         cond = payload
         has_or = "||" in cond
-        assigns, null_atom = [], False
+        assigns, null_atom, derived = [], False, []
         for atom in re.split(r"\|\||&&", cond):
             res = _atom_assignment(atom, ptr_name or "", struct_var or "",
                                    scalar_names, globals_map)
-            if not res:
+            if res:
+                if res[0] == "null":
+                    null_atom = True
+                elif res[0] != "notnull":
+                    if res[0] == "global":
+                        used_globals[res[1]] = globals_map.get(res[1], "int")
+                    assigns.append(res)   # (kind, target, tval, fval)
                 continue
-            if res[0] == "null":
-                null_atom = True
-            elif res[0] != "notnull":
-                if res[0] == "global":
-                    used_globals[res[1]] = globals_map.get(res[1], "int")
-                assigns.append(res)   # (kind, target, tval, fval)
+            # 직접 분류 실패 -> 로컬변수에서 파생된 조건인지 확인
+            cm = _CMP_RE.match(_strip_outer_parens(atom.strip()))
+            if cm and cm.group(1).strip() in local_deps:
+                rrhs = cm.group(3).strip()
+                for (bk, bt) in local_deps[cm.group(1).strip()]:
+                    derived.append((bk, bt, rrhs))
+                    if bk == "global":
+                        used_globals[bt] = globals_map.get(bt, "int")
 
         merged = _mk(ctx, [(k, t, tv) for (k, t, tv, fv) in assigns])
         stack.append(_frame(indent, merged))
@@ -422,7 +505,21 @@ def _smart_vectors(params: list[dict], body: list[tuple],
                 ov = [(kk, tt, (fv2 if j == i else tv2))
                       for j, (kk, tt, tv2, fv2) in enumerate(assigns)]
                 raw.append(_mk(ctx, ov))
+        # 파생 로컬: base 변수를 극단값 + (안전한)조건 임계값으로 스윕 (양방향 도달)
+        # rrhs 는 상수/매크로일 때만 사용 (m->x, 파라미터 참조는 하니스 스코프에 없음)
+        for bk, bt, rrhs in derived:
+            vals = ["-99999", "99999"]
+            if _SAFE_CONST.match(rrhs):
+                vals.append(rrhs)
+            for val in vals:
+                raw.append(_mk(ctx, [(bk, bt, val)]))
         raw.append(_mk(merged, []))
+
+        # early-return 가드면, 그 부정(통과 전제조건)을 이후 벡터 base 에 누적.
+        # OR/단일조건 가드만(부정이 '모든 원자 거짓'으로 정확) — AND 가드는 모호해 제외.
+        if is_guard and "&&" not in cond and assigns:
+            for k, t, tv, fv in assigns:
+                precond[_bucket[k]][t] = fv
 
     vectors, seen = [], set()
     for rv in raw:
@@ -458,7 +555,7 @@ def _smart_vectors(params: list[dict], body: list[tuple],
                for f, s in ((g, f"__sret_{g}") for g in stub_rets)
                if rv["srets"].get(s, "0") != "0"}
         vectors.append({"setup": setup, "args": args, "srets": srt})
-        if len(vectors) >= 64:
+        if len(vectors) >= 96:
             break
     return (vectors or None), used_globals
 
@@ -480,6 +577,20 @@ def _emit_harness(func_name: str, detail: dict, vectors: list[dict],
             L.append(f'#include "{h}"')
             break
     L.append("")
+
+    # 소스 파일의 object-like 매크로를 하니스에도 정의
+    # (파생 스윕 값이 .c 내부 #define 매크로일 수 있음 — 별도 TU 라 안 보임)
+    try:
+        with open(abs_src, encoding="utf-8", errors="replace") as _f:
+            for _line in _f:
+                dm = re.match(r"\s*#\s*define\s+([A-Za-z_]\w*)\s+(\S.*?)\s*$", _line)
+                if dm:   # object-like (이름 뒤 공백) 만; 함수형 매크로는 미매치
+                    L.append(f"#ifndef {dm.group(1)}")
+                    L.append(f"#define {dm.group(1)} {dm.group(2)}")
+                    L.append("#endif")
+        L.append("")
+    except OSError:
+        pass
 
     # 조건에서 참조된 전역변수 — extern 으로 선언해 하니스에서 세팅
     for g, gtype in (globals_used or {}).items():
