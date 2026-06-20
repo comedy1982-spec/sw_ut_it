@@ -696,6 +696,7 @@ function renderTcs() {
 
     const sep = document.createElement('div');
     sep.className = 'tc-unit-sep';
+    sep.dataset.ref = ref;
     sep.innerHTML = `<span>▸ ${fname}  (${data.cases.length}건)</span>
       <span class="tc-cov-chips">
         ${tcChip('STMT',cov.statement)}${tcChip('BR',cov.branch)}${tcChip('MC/DC',cov.mcdc)}
@@ -713,7 +714,11 @@ function renderTcs() {
       cb.onchange = () => {
         if (cb.checked) checkedTcs.add(`${ref}::${tc.id}`);
         else            checkedTcs.delete(`${ref}::${tc.id}`);
-        renderSource();
+        if (unitCov[ref] && unitCov[ref].mode === 'clang-mcdc') {
+          scheduleRecompute(ref);   // 실측 모드: 선택된 TC만 백엔드 재측정
+        } else {
+          renderSource();           // 목업/토글: 프론트 즉시 반영
+        }
       };
 
       const body = document.createElement('div');
@@ -785,6 +790,46 @@ function updateAggChips() {
     s.className='chip'; s.style.color=col; s.style.background=bg;
     s.textContent=`${l} ${v}%`; c.appendChild(s);
   });
+}
+
+/* 유닛별 커버리지 칩 갱신 (전체 재렌더 없이) */
+function updateUnitChips(ref) {
+  const cov = unitCov[ref] && unitCov[ref].coverage;
+  if (!cov) return;
+  const sep = document.querySelector(`.tc-unit-sep[data-ref="${ref}"] .tc-cov-chips`);
+  if (sep) sep.innerHTML =
+    `${tcChip('STMT',cov.statement)}${tcChip('BR',cov.branch)}${tcChip('MC/DC',cov.mcdc)}`;
+}
+
+/* ═══════════════════════════════════════════
+   clang-mcdc: 선택된 TC만 백엔드 재측정 (정확한 STMT/BR/MC/DC)
+═══════════════════════════════════════════ */
+const _recomputeTimers = {};
+function scheduleRecompute(ref) {
+  clearTimeout(_recomputeTimers[ref]);
+  _recomputeTimers[ref] = setTimeout(() => doRecompute(ref), 250);
+}
+async function doRecompute(ref) {
+  const data = unitCov[ref];
+  if (!data) return;
+  const tcIds = data.cases.map(c => c.id).filter(id => checkedTcs.has(`${ref}::${id}`));
+  try {
+    const r = await fetch('/api/cov_select', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({unit_ref: ref, tc_ids: tcIds})});
+    const res = await r.json();
+    if (res && res.ok) {
+      data.coverage     = res.coverage;
+      data.source       = res.source;
+      data.mcdc_records = res.mcdc_records || [];
+      renderSource();
+      const tcsEl = document.getElementById('tcs');   // 칩 + MC/DC 패널 갱신
+      const sc = tcsEl.scrollTop;
+      renderTcs();
+      tcsEl.scrollTop = sc;
+      updateAggChips();
+    }
+  } catch (e) { /* 네트워크 오류 시 무시 */ }
 }
 
 /* ═══════════════════════════════════════════

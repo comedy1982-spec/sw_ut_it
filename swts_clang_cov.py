@@ -72,6 +72,13 @@ def _get_func_detail(abs_path: str, func_name: str, flags: list[str]) -> Optiona
                             for i, a in enumerate(node.get_arguments())],
             }
 
+    # 최상위 전역변수(외부 링키지) 수집 — 하니스에서 extern 으로 세팅 가능
+    all_globals: dict[str, str] = {}
+    for node in tu.cursor.get_children():
+        if (node.kind == cidx.CursorKind.VAR_DECL and node.spelling
+                and node.linkage == cidx.LinkageKind.EXTERNAL):
+            all_globals[node.spelling] = node.type.spelling
+
     # 대상 함수 찾기
     for node in tu.cursor.get_children():
         if (node.kind == cidx.CursorKind.FUNCTION_DECL
@@ -98,6 +105,7 @@ def _get_func_detail(abs_path: str, func_name: str, flags: list[str]) -> Optiona
                 "params": params,
                 "callees": callees,
                 "all_sigs": all_func_sigs,
+                "all_globals": all_globals,
             }
     return None
 
@@ -166,7 +174,7 @@ def _op_values(op: str, rhs: str) -> tuple:
     }.get(op, (rhs, plus))
 
 
-def _classify_lhs(lhs, tval, fval, ptr_name, struct_var, scalar_names):
+def _classify_lhs(lhs, tval, fval, ptr_name, struct_var, scalar_names, globals_map):
     lhs = lhs.strip()
     if ptr_name and lhs.startswith(ptr_name + "->"):
         field = lhs[len(ptr_name) + 2:].strip()
@@ -175,10 +183,12 @@ def _classify_lhs(lhs, tval, fval, ptr_name, struct_var, scalar_names):
         return None
     if lhs in scalar_names:
         return ("scalar", lhs, tval, fval)
-    return None  # 전역변수/미지 -> 건너뜀 (설정 불가)
+    if lhs in globals_map:               # 전역변수 -> 하니스에서 extern 으로 세팅
+        return ("global", lhs, tval, fval)
+    return None  # 미지 -> 건너뜀 (설정 불가)
 
 
-def _atom_assignment(atom, ptr_name, struct_var, scalar_names):
+def _atom_assignment(atom, ptr_name, struct_var, scalar_names, globals_map):
     """원자 조건 1개 -> (kind, target, true_value, false_value)."""
     a = atom.strip().strip("()").strip()
     if not a:
@@ -191,18 +201,20 @@ def _atom_assignment(atom, ptr_name, struct_var, scalar_names):
     if m:
         lhs, op, rhs = m.group(1).strip(), m.group(2), m.group(3).strip()
         tval, fval = _op_values(op, rhs)
-        return _classify_lhs(lhs, tval, fval, ptr_name, struct_var, scalar_names)
+        return _classify_lhs(lhs, tval, fval, ptr_name, struct_var, scalar_names, globals_map)
     m = re.match(r"^(.+?)\s*&\s*(.+)$", a)        # 비트 AND: lhs & mask
     if m:
         return _classify_lhs(m.group(1).strip(), m.group(2).strip(), "0",
-                             ptr_name, struct_var, scalar_names)
+                             ptr_name, struct_var, scalar_names, globals_map)
     if a.startswith("!"):                          # !x  -> true:0 false:1
-        return _classify_lhs(a[1:].strip(), "0", "1", ptr_name, struct_var, scalar_names)
-    return _classify_lhs(a, "1", "0", ptr_name, struct_var, scalar_names)  # x -> true:1
+        return _classify_lhs(a[1:].strip(), "0", "1", ptr_name, struct_var, scalar_names, globals_map)
+    return _classify_lhs(a, "1", "0", ptr_name, struct_var, scalar_names, globals_map)  # x -> true:1
 
 
-def _smart_vectors(params: list[dict], body: list[tuple]) -> Optional[list[dict]]:
-    """함수 본문 분기 조건을 분석해 도달성 높은 테스트 벡터 생성."""
+def _smart_vectors(params: list[dict], body: list[tuple],
+                   globals_map: dict) -> tuple:
+    """함수 본문 분기 조건을 분석해 도달성 높은 테스트 벡터 생성.
+       반환: (vectors, used_globals{name:type}) — 실패 시 (None, {})."""
     ptr_name = ptr_type = None
     ptr_idx = -1
     scalar_names: dict = {}
@@ -219,7 +231,7 @@ def _smart_vectors(params: list[dict], body: list[tuple]) -> Optional[list[dict]
         else:
             scalar_names[n] = idx
     if ptr_name is None and not scalar_names:
-        return None
+        return None, {}
     struct_var = f"_s{ptr_idx}" if ptr_idx >= 0 else None
 
     branch_re = re.compile(r"^\}?\s*(?:else\s+if|if|while|for)\s*\((.*)\)\s*\{?\s*$")
@@ -230,63 +242,78 @@ def _smart_vectors(params: list[dict], body: list[tuple]) -> Optional[list[dict]
             indent = len(text) - len(text.lstrip())
             parsed.append((indent, m.group(1).strip()))
     if not parsed:
-        return None
+        return None, {}
 
-    raw = [{"fields": {}, "scalars": {}, "null": False}]   # baseline
+    used_globals: dict = {}
+
+    def _blank():
+        return {"fields": {}, "scalars": {}, "globals": {}, "null": False}
+
+    raw = [_blank()]                       # baseline
     if ptr_name:
-        raw.append({"fields": {}, "scalars": {}, "null": True})
+        nullv = _blank(); nullv["null"] = True
+        raw.append(nullv)
 
     stack: list = []   # (indent, ctx)
     for indent, cond in parsed:
         while stack and stack[-1][0] >= indent:
             stack.pop()
-        ctx_f, ctx_s = {}, {}
+        ctx = {"fields": {}, "scalars": {}, "globals": {}}
         for _, c in stack:
-            ctx_f.update(c["fields"]); ctx_s.update(c["scalars"])
+            ctx["fields"].update(c["fields"])
+            ctx["scalars"].update(c["scalars"])
+            ctx["globals"].update(c["globals"])
 
         has_or = "||" in cond
         assigns, null_atom = [], False
         for atom in re.split(r"\|\||&&", cond):
-            res = _atom_assignment(atom, ptr_name or "", struct_var or "", scalar_names)
+            res = _atom_assignment(atom, ptr_name or "", struct_var or "",
+                                   scalar_names, globals_map)
             if not res:
                 continue
             if res[0] == "null":
                 null_atom = True
             elif res[0] != "notnull":
+                if res[0] == "global":
+                    used_globals[res[1]] = globals_map.get(res[1], "int")
                 assigns.append(res)   # (kind, target, tval, fval)
 
-        def _mk(base_f, base_s, overrides):
-            v = {"fields": dict(base_f), "scalars": dict(base_s), "null": False}
+        _bucket = {"field": "fields", "scalar": "scalars", "global": "globals"}
+
+        def _mk(base, overrides):
+            v = {"fields": dict(base["fields"]), "scalars": dict(base["scalars"]),
+                 "globals": dict(base["globals"]), "null": False}
             for kind, tgt, val in overrides:
-                (v["fields"] if kind == "field" else v["scalars"])[tgt] = val
+                v[_bucket[kind]][tgt] = val
             return v
 
         # 분기 진입(decision=참): 모든 원자 참
-        all_true = [(k, t, tv) for (k, t, tv, fv) in assigns]
-        merged_f, merged_s = dict(ctx_f), dict(ctx_s)
-        for kind, tgt, val in all_true:
-            (merged_f if kind == "field" else merged_s)[tgt] = val
-        stack.append((indent, {"fields": merged_f, "scalars": merged_s}))
+        merged = _mk(ctx, [(k, t, tv) for (k, t, tv, fv) in assigns])
+        stack.append((indent, merged))
 
         if null_atom:
-            raw.append({"fields": dict(ctx_f), "scalars": dict(ctx_s), "null": True})
+            nv = _mk(ctx, []); nv["null"] = True
+            raw.append(nv)
 
         if has_or:
             # OR: 각 원자 단독 참(독립영향) + 모든 원자 거짓(decision=거짓)
             for k, t, tv, fv in assigns:
-                raw.append(_mk(ctx_f, ctx_s, [(k, t, tv)]))
-            raw.append(_mk(ctx_f, ctx_s, [(k, t, fv) for (k, t, tv, fv) in assigns]))
+                raw.append(_mk(ctx, [(k, t, tv)]))
+            raw.append(_mk(ctx, [(k, t, fv) for (k, t, tv, fv) in assigns]))
         else:
             # AND: 각 원자만 거짓(나머지 참, 독립영향)
             for i, (k, t, tv, fv) in enumerate(assigns):
                 ov = [(kk, tt, (fv2 if j == i else tv2))
                       for j, (kk, tt, tv2, fv2) in enumerate(assigns)]
-                raw.append(_mk(ctx_f, ctx_s, ov))
-        raw.append({"fields": dict(merged_f), "scalars": dict(merged_s), "null": False})
+                raw.append(_mk(ctx, ov))
+        raw.append(_mk(merged, []))
 
     vectors, seen = [], set()
     for rv in raw:
         setup, args = [], []
+        # 전역변수는 매 TC 마다 명시적으로 세팅(누수 방지)
+        for g in used_globals:
+            setup.append(f"{g} = {rv['globals'].get(g, '0')};")
         for idx, p in enumerate(params):
             n = p["name"]
             if idx == ptr_idx:
@@ -311,16 +338,17 @@ def _smart_vectors(params: list[dict], body: list[tuple]) -> Optional[list[dict]
         vectors.append({"setup": setup, "args": args})
         if len(vectors) >= 48:
             break
-    return vectors or None
+    return (vectors or None), used_globals
 
 
 # ============================================================
 # 4. harness.c 생성
 # ============================================================
 def _emit_harness(func_name: str, detail: dict, vectors: list[dict],
-                  include_dirs: list[str], abs_src: str) -> str:
+                  globals_used: dict, include_dirs: list[str], abs_src: str) -> str:
     L = ["/* SWTS auto-generated harness for Clang MC/DC */",
-         "#include <stdio.h>", "#include <stddef.h>", "#include <string.h>", ""]
+         "#include <stdio.h>", "#include <stddef.h>", "#include <string.h>",
+         "#include <stdlib.h>", ""]
 
     # 소스에 대응하는 헤더 include
     src_stem = os.path.splitext(os.path.basename(abs_src))[0]
@@ -330,6 +358,12 @@ def _emit_harness(func_name: str, detail: dict, vectors: list[dict],
             L.append(f'#include "{h}"')
             break
     L.append("")
+
+    # 조건에서 참조된 전역변수 — extern 으로 선언해 하니스에서 세팅
+    for g, gtype in (globals_used or {}).items():
+        L.append(f"extern {gtype} {g};")
+    if globals_used:
+        L.append("")
 
     # 피호출 함수 stub (올바른 시그니처 사용)
     sigs = detail["all_sigs"]
@@ -354,10 +388,12 @@ def _emit_harness(func_name: str, detail: dict, vectors: list[dict],
     # 반환값을 stdout 으로 출력 -> 상위에서 expected 실측값으로 파싱
     ret_type = (detail.get("ret_type") or "int").strip()
     is_void  = ret_type == "void"
-    L.append("int main(void) {")
+    # argv[1] 이 주어지면 해당 TC 만 실행(TC별 커버리지 측정용), 없으면 전체
+    L.append("int main(int argc, char** argv) {")
+    L.append("  int __only = (argc > 1) ? atoi(argv[1]) : 0;")
     for i, vec in enumerate(vectors, 1):
         L.append(f"  /* TC-{i:03d} */")
-        L.append("  {")
+        L.append(f"  if (__only == 0 || __only == {i}) {{")
         for stmt in vec["setup"]:
             L.append(f"    {stmt}")
         call_args = ", ".join(vec["args"])
@@ -399,11 +435,13 @@ def build(clang: str, harness: str, src_file: str,
 # ============================================================
 # 6. 실행 + 프로파일 수집
 # ============================================================
-def run_collect(exe: str, workdir: str) -> tuple[str, str]:
-    profraw = os.path.join(workdir, "run.profraw")
+def run_collect(exe: str, workdir: str, tc: Optional[int] = None,
+                profname: str = "run.profraw") -> tuple[str, str]:
+    profraw = os.path.join(workdir, profname)
     env = os.environ.copy()
     env["LLVM_PROFILE_FILE"] = profraw
-    proc = subprocess.run([exe], cwd=workdir, env=env,
+    cmd = [exe] + ([str(tc)] if tc else [])
+    proc = subprocess.run(cmd, cwd=workdir, env=env,
                           capture_output=True, text=True, timeout=30)
     return profraw, (proc.stdout or "")
 
@@ -411,10 +449,12 @@ def run_collect(exe: str, workdir: str) -> tuple[str, str]:
 # ============================================================
 # 7. 프로파일 병합
 # ============================================================
-def merge_profile(llvm_profdata: str, profraw: str, workdir: str) -> str:
-    profdata = os.path.join(workdir, "run.profdata")
+def merge_profile(llvm_profdata: str, profraw, workdir: str,
+                  out: str = "run.profdata") -> str:
+    profdata = os.path.join(workdir, out)
+    inputs = profraw if isinstance(profraw, (list, tuple)) else [profraw]
     subprocess.run(
-        [llvm_profdata, "merge", "-sparse", profraw, "-o", profdata],
+        [llvm_profdata, "merge", "-sparse", *inputs, "-o", profdata],
         check=True, capture_output=True,
     )
     return profdata
@@ -508,6 +548,58 @@ def build_source(abs_src: str, start_ln: int, end_ln: int,
 
 
 # ============================================================
+# 10-b. 유닛별 측정 캐시 (체크박스 토글 재계산용)
+# ============================================================
+_COV_CACHE: dict = {}   # unit_ref -> {workdir, exe, ...}
+_COV_CACHE_MAX = 8
+
+
+def _cache_unit(unit_ref: str, meta: dict) -> None:
+    """유닛 측정 결과 보존. 오래된 항목은 워크디렉터리 정리 후 제거."""
+    old = _COV_CACHE.pop(unit_ref, None)
+    if old and old.get("workdir"):
+        shutil.rmtree(old["workdir"], ignore_errors=True)
+    _COV_CACHE[unit_ref] = meta
+    while len(_COV_CACHE) > _COV_CACHE_MAX:
+        _k, _v = next(iter(_COV_CACHE.items()))
+        _COV_CACHE.pop(_k, None)
+        if _v.get("workdir"):
+            shutil.rmtree(_v["workdir"], ignore_errors=True)
+
+
+def recompute(unit_ref: str, tc_ids: list) -> Optional[dict]:
+    """선택된 TC 들만 병합해 커버리지 재측정 (정확한 STMT/BR/MC/DC)."""
+    meta = _COV_CACHE.get(unit_ref)
+    if not meta:
+        return None
+    sel = sorted({int(re.sub(r"\D", "", str(t))) for t in tc_ids if re.search(r"\d", str(t))})
+    sel = [i for i in sel if 1 <= i <= meta["n_tcs"]]
+    wd = meta["workdir"]
+    if not sel:   # 아무것도 선택 안 함 -> 0%
+        src = build_source(meta["abs_src"], meta["start_ln"], meta["end_ln"], {})
+        return {"ok": True, "coverage": {"statement": 0, "branch": 0, "mcdc": 0},
+                "mcdc_records": [], "source": src}
+    profraws = [os.path.join(wd, f"tc_{i}.profraw") for i in sel
+                if os.path.exists(os.path.join(wd, f"tc_{i}.profraw"))]
+    if not profraws:
+        return None
+    try:
+        pd = merge_profile(meta["profdata_tool"], profraws, wd, out="sel.profdata")
+        cdata = export_cov(meta["cov_tool"], meta["exe"], pd)
+        cov = parse_cov(cdata, meta["src_basename"])
+    except Exception:
+        return None
+    source = build_source(meta["abs_src"], meta["start_ln"], meta["end_ln"], cov["line_hits"])
+    return {
+        "ok": True,
+        "coverage": {"statement": cov["stmt_pct"], "branch": cov["branch_pct"],
+                     "mcdc": cov["mcdc_pct"]},
+        "mcdc_records": cov["mcdc_records"],
+        "source": source,
+    }
+
+
+# ============================================================
 # 11. 진입점
 # ============================================================
 def generate(unit_ref: str, abs_src: str, func_name: str,
@@ -545,13 +637,19 @@ def generate(unit_ref: str, abs_src: str, func_name: str,
                 for i in range(start_ln, min(end_ln, len(_all)) + 1)]
     except OSError:
         body = []
-    vectors = _smart_vectors(detail["params"], body) or _gen_vectors(detail["params"])
-    log("info", f"[clang-mcdc] 테스트 벡터 {len(vectors)}개 생성")
+    vectors, globals_used = _smart_vectors(
+        detail["params"], body, detail.get("all_globals", {}))
+    if not vectors:
+        vectors, globals_used = _gen_vectors(detail["params"]), {}
+    log("info", f"[clang-mcdc] 테스트 벡터 {len(vectors)}개 생성"
+                + (f" (전역 {len(globals_used)}개 세팅)" if globals_used else ""))
 
     workdir = tempfile.mkdtemp(prefix="swts_mcdc_")
+    keep_workdir = False
     try:
         # harness 생성
-        harness_code = _emit_harness(func_name, detail, vectors, include_dirs, abs_src)
+        harness_code = _emit_harness(func_name, detail, vectors,
+                                     globals_used, include_dirs, abs_src)
         harness_path = os.path.join(workdir, "harness.c")
         with open(harness_path, "w", encoding="utf-8") as f:
             f.write(harness_code)
@@ -582,6 +680,23 @@ def generate(unit_ref: str, abs_src: str, func_name: str,
             f"| MC/DC {cov['mcdc_pct']}% ({cov['mcdc_count']} decisions)")
 
         source = build_source(abs_src, start_ln, end_ln, cov["line_hits"])
+
+        # ── TC별 profraw 생성 (체크박스 토글 시 recompute 로 정확 재측정) ──
+        log("info", f"[clang-mcdc] TC별 profraw 생성 ({len(vectors)}개)")
+        for i in range(1, len(vectors) + 1):
+            try:
+                run_collect(exe, workdir, tc=i, profname=f"tc_{i}.profraw")
+            except Exception:
+                pass
+
+        # 재계산(recompute)용으로 워크디렉터리/메타 캐시 보존
+        keep_workdir = True
+        _cache_unit(unit_ref, {
+            "workdir": workdir, "exe": exe, "src_basename": src_basename,
+            "start_ln": start_ln, "end_ln": end_ln, "abs_src": abs_src,
+            "n_tcs": len(vectors), "profdata_tool": profdata_tool,
+            "cov_tool": cov_tool,
+        })
 
         # 자동 생성 TC 목록 (expected = 하니스 실측 반환값)
         cases = [
@@ -621,4 +736,5 @@ def generate(unit_ref: str, abs_src: str, func_name: str,
         log("error", f"[clang-mcdc] 실패: {e}")
         return None
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+        if not keep_workdir:
+            shutil.rmtree(workdir, ignore_errors=True)

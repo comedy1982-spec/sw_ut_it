@@ -189,6 +189,23 @@ def api_generate():
     return jsonify({"ok": False, "error": f"unknown unit_ref: {unit_ref}"})
 
 
+@app.route("/api/cov_select", methods=["POST"])
+def api_cov_select():
+    """선택된 TC 들만으로 커버리지 재측정 (clang-mcdc 모드 체크박스 토글)."""
+    body = request.json or {}
+    unit_ref = body.get("unit_ref", "")
+    tc_ids = body.get("tc_ids", [])
+    if not (ENGINES and CLANG_COV):
+        return jsonify({"ok": False, "error": "clang 미사용"})
+    try:
+        res = swts_clang_cov.recompute(unit_ref, tc_ids)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+    if not res:
+        return jsonify({"ok": False, "error": "캐시 없음 (재생성 필요)"})
+    return jsonify(res)
+
+
 # ============================================================
 # 실제 소스 파일 읽기 + Clang 정적 TC 생성
 # ============================================================
