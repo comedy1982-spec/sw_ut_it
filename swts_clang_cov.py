@@ -886,6 +886,16 @@ def parse_cov(cov_data: dict, src_basename: str,
         line_hits[line] = max(line_hits.get(line, 0), cand)
         if has_count:                 # 이월 갱신(후보 계산 후)
             wrapped = count
+    # 공백 라인은 실행문이 아님(switch case 사이 빈 줄이 gap 세그먼트로 0-count
+    # 등재되는 아티팩트) -> 소스 텍스트로 판정해 통계에서 제외. break 등 실제
+    # 실행문은 비어있지 않으므로 유지된다.
+    try:
+        with open(target.get("filename", ""), encoding="utf-8", errors="replace") as _f:
+            _srclines = _f.readlines()
+        line_hits = {ln: c for ln, c in line_hits.items()
+                     if not (1 <= ln <= len(_srclines) and _srclines[ln - 1].strip() == "")}
+    except OSError:
+        pass
 
     # ── 함수 단위 스코핑 (가능하면) — 대상 함수만의 STMT/BR/MC/DC ──
     fn = None
