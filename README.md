@@ -65,3 +65,19 @@ python app.py                       # → http://localhost:5000
 | POST | `/api/generate` | 유닛 → 커버리지 + TC |
 | POST | `/api/cov_select` | 선택 TC만 재측정 |
 | POST | `/api/report` | HTML 리포트 |
+
+## 측정 결과 (예제 `ecu_powertrain`, clang-mcdc 실측)
+
+**12개 유닛 중 11개가 STMT/BR/MC-DC = 100%/100%/100%.** SMT-ATG(진리표→독립쌍→Z3
+역산), 강건성 한계값 주입(2.4), else-if 형제 부정, parse_cov 라인카운트 보정으로
+달성했습니다.
+
+남은 1건 `motor_set_duty` L17의 `g_estop` 조건은 **도구 한계가 아니라 코드 결함**
+입니다 — `static int g_estop`(파일 내부)이 setter 없이 "외부에서 셋"으로 주석돼
+있어 영원히 0(죽은 코드). MC-DC가 이 도달 불가 조건을 정확히 신고했습니다.
+→ [JUSTIFICATIONS.md](JUSTIFICATIONS.md)(J-001) 참고.
+
+## 문서
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) — 구조·동작·핵심원리(AST·진리표·SMT·강건성)·API·한계
+- [JUSTIFICATIONS.md](JUSTIFICATIONS.md) — 커버리지 정당화/결함 기록
