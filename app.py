@@ -33,6 +33,7 @@ SWTS_ROOT = os.environ.get("SWTS_ROOT",
 SWTS_ROOT = os.path.abspath(SWTS_ROOT)
 
 app = Flask(__name__)
+app.config['TEMPLATES_AUTO_RELOAD'] = True
 
 # 마지막 스캔 결과 캐시 {abs_root: scan_result}
 _scan_cache: dict = {}
