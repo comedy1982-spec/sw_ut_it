@@ -112,6 +112,10 @@
   .unit-name{font-family:var(--mono);font-size:12px;
              white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .unit-meta{font-size:10px;color:var(--dim);font-family:var(--mono);margin-top:1px}
+  /* 유닛별 Result(테스트 후 STMT/BR/MC-DC %) */
+  .unit-result{display:flex;flex-wrap:wrap;gap:3px;margin-top:3px}
+  .ures{font-size:9px;font-weight:700;font-family:var(--mono);
+        padding:1px 5px;border-radius:3px;background:#1e2730}
   .pill{display:inline-block;font-size:9px;font-weight:700;font-family:var(--mono);
         padding:1px 4px;border-radius:3px;margin-left:3px;vertical-align:1px}
   .pill.A{color:var(--green);background:var(--greenbg)}
@@ -260,6 +264,8 @@
     <div class="phead">
       컴포넌트 / 유닛
       <div class="phead-r">
+        <button class="btn-sm" onclick="expandAll()" title="모든 컴포넌트 펼치기">▼ 펼치기</button>
+        <button class="btn-sm" onclick="collapseAll()" title="모든 컴포넌트 접기">▶ 접기</button>
         <button class="btn-sm" onclick="checkAll()">전체선택</button>
         <button class="btn-sm" onclick="uncheckAll()">해제</button>
       </div>
@@ -576,6 +582,7 @@ function toggleGenUnit(ref, cb, row) {
   if (cb.checked) { checkedGen.add(ref); row.classList.add('checked'); }
   else            { checkedGen.delete(ref); row.classList.remove('checked'); }
   updateSelCount();
+  if (Object.keys(unitCov).length) renderTcs();   // 선택 변경 시 TC 패널 갱신
 }
 function updateSelCount() {
   const n = checkedGen.size;
@@ -589,6 +596,7 @@ function checkAll() {
     row.classList.add('checked');
   });
   updateSelCount();
+  if (Object.keys(unitCov).length) renderTcs();
 }
 function uncheckAll() {
   document.querySelectorAll('.unit-cb').forEach(cb => {
@@ -596,6 +604,45 @@ function uncheckAll() {
     cb.closest('.unit-row').classList.remove('checked');
   });
   checkedGen.clear(); updateSelCount();
+  if (Object.keys(unitCov).length) renderTcs();
+}
+
+/* ═══════════════════════════════════════════
+   트리 펼치기 / 접기
+═══════════════════════════════════════════ */
+function expandAll() {
+  document.querySelectorAll('.comp-block').forEach(b => {
+    b.querySelector('.unit-list')?.classList.add('open');
+    b.querySelector('.comp-toggle')?.classList.add('open');
+  });
+}
+function collapseAll() {
+  document.querySelectorAll('.unit-list').forEach(ul => ul.classList.remove('open'));
+  document.querySelectorAll('.comp-toggle').forEach(t => t.classList.remove('open'));
+}
+
+/* ═══════════════════════════════════════════
+   유닛별 Result (테스트 후 트리에 STMT/BR/MC-DC %)
+═══════════════════════════════════════════ */
+function resChip(label, v) {
+  v = (v == null) ? 0 : v;
+  const col = v >= 100 ? 'var(--green)' : v >= 75 ? 'var(--amber)' : 'var(--red)';
+  return `<span class="ures" style="color:${col}">${label} ${v}%</span>`;
+}
+function updateUnitResults() {
+  document.querySelectorAll('.unit-row').forEach(row => {
+    const data = unitCov[row.dataset.ref];
+    let el = row.querySelector('.unit-result');
+    if (!data) { if (el) el.remove(); return; }
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'unit-result';
+      row.querySelector('.unit-info').appendChild(el);
+    }
+    const c = data.coverage || {};
+    el.innerHTML = resChip('STMT', c.statement) +
+                   resChip('BR', c.branch) + resChip('MC/DC', c.mcdc);
+  });
 }
 
 /* ═══════════════════════════════════════════
@@ -659,6 +706,7 @@ document.getElementById('genBtn').onclick = async () => {
   renderSource();
   renderTcs();
   updateAggChips();
+  updateUnitResults();        // 트리 유닛 옆 Result(STMT/BR/MC-DC %) 표시
   btn.disabled = false; btn.textContent = '▶ TC 생성';
   document.getElementById('reportBtn').disabled = Object.keys(unitCov).length === 0;
   updateSelCount();
@@ -751,7 +799,15 @@ function renderSource() {
 function renderTcs() {
   const host = document.getElementById('tcs');
   host.innerHTML = '';
-  for (const [ref, data] of Object.entries(unitCov)) {
+  // 선택(체크)된 유닛의 테스트케이스만 표시
+  const entries = Object.entries(unitCov).filter(([ref]) => checkedGen.has(ref));
+  if (!entries.length) {
+    host.innerHTML = Object.keys(unitCov).length
+      ? '<div class="empty">선택된 유닛이 없습니다.<br>좌측에서 유닛을 체크하면<br>해당 테스트케이스가 표시됩니다.</div>'
+      : '<div class="empty">유닛을 체크 후 \'TC 생성\' 버튼을 누르세요.</div>';
+    return;
+  }
+  for (const [ref, data] of entries) {
     const fname = ref.split('::')[1] || ref;
     const cov   = data.coverage;
 
@@ -910,6 +966,7 @@ async function doRecompute(ref) {
       renderTcs();
       tcsEl.scrollTop = sc;
       updateAggChips();
+      updateUnitResults();     // 재측정 후 트리 Result 갱신
     }
   } catch (e) { /* 네트워크 오류 시 무시 */ }
 }
